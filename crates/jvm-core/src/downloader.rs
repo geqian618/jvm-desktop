@@ -1,0 +1,798 @@
+//! 下载器：分块并发 + 断点续传 + SHA-256 校验。
+//!
+//! 流程：
+//! 1. 入口先解析校验和（API 字段优先，其次 `.sha256.txt` 校验和文件），
+//!    来源不可得在下载开始前就能从日志看到，而不是数百 MB 下载完才发现；
+//! 2. HEAD / Range-0-0 探测总长度与 Range 支持；
+//! 3. 支持 Range 且文件较大时按 `concurrency` 分块，每块独立 Range 请求，
+//!    进度持久化到 `<dest>.part.json` 边车文件，重试/续传按块推进；
+//! 4. 完成后流式计算整文件 SHA-256 并比对，通过后才把 `.part` 原子改名
+//!    为最终文件——任何失败都不会产生半成品。
+//!
+//! 校验和来源全部不可得时（如 Oracle 旧版本的 .sha256.txt 已从官网下架，
+//! foojay 的 checksum 字段也为空）跳过校验继续下载并告警：这类源的下载
+//! 在旧策略下永远失败；归档有效性由安装阶段的 `java -version` 兜底验证。
+//!
+//! 跨平台说明：文件写入只用 std 文件 API，分块共享一个 `Mutex<File>` 按
+//! 绝对偏移写，Windows/Unix 行为一致；无平台专属代码。
+
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::error::{Error, Result};
+
+/// 进度回调：`(已完成字节, 总字节)`；总字节未知时为 0。
+pub type ProgressFn = dyn Fn(u64, u64) + Send + Sync;
+
+/// 单块读取停滞超时：超过则中断本次请求，按断点重试。
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// 每块进度落盘间隔（字节）。
+const PERSIST_EVERY: u64 = 4 * 1024 * 1024;
+/// 文件不小于该值才启用多块并发。
+const MIN_CHUNKED_SIZE: u64 = 16 * 1024 * 1024;
+/// 每块最小 4MiB，避免小块过多。
+const MIN_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+/// 单块最大尝试次数。
+const MAX_ATTEMPTS: u32 = 5;
+/// 下载断点（*.part / *.part.json）的保留时长：取消/失败保留断点用于续传，
+/// 超过此时长仍未重试即视为垃圾，由 [`clean_stale_parts`] 回收。
+pub const STALE_PART_TTL: Duration = Duration::from_secs(12 * 3600);
+
+#[derive(Debug)]
+pub struct DownloadTask {
+    pub client: reqwest::Client,
+    pub url: String,
+    /// 最终落盘路径；下载期间写 `<dest>.part`。
+    pub dest_file: PathBuf,
+    /// API 提供的 sha256（优先）。
+    pub expected_sha256: Option<String>,
+    /// 兜底校验和地址（如 `<url>.sha256.txt`）。
+    pub checksum_url: Option<String>,
+    /// 下载计划给出的期望大小：无校验和时用于完整性兜底校验。
+    pub expected_size: Option<u64>,
+    /// 分块并发数（服务器支持 Range 时生效，1–16）。
+    pub concurrency: usize,
+    /// 取消开关：置 true 后各分块尽快中断（GUI 的取消按钮）。
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+impl DownloadTask {
+    fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChunkState {
+    start: u64,
+    /// 含端点；总长未知时为 u64::MAX（该模式不支持续传）。
+    end: u64,
+    done: u64,
+}
+
+impl ChunkState {
+    fn len(&self) -> u64 {
+        if self.end == u64::MAX {
+            u64::MAX
+        } else {
+            self.end - self.start + 1
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Sidecar {
+    url: String,
+    total: u64,
+    #[serde(default)]
+    etag: Option<String>,
+    chunks: Vec<ChunkState>,
+}
+
+struct Shared {
+    file: Mutex<std::fs::File>,
+    sidecar: Mutex<Sidecar>,
+    sidecar_path: PathBuf,
+    total_done: AtomicU64,
+    progress: Option<Arc<ProgressFn>>,
+    total: u64,
+}
+
+impl Shared {
+    fn report(&self) {
+        if let Some(cb) = &self.progress {
+            cb(self.total_done.load(Ordering::Relaxed), self.total);
+        }
+    }
+
+    fn persist(&self) {
+        if let Ok(sc) = self.sidecar.lock() {
+            let _ = self.persist_sc(&sc);
+        }
+    }
+
+    fn persist_sc(&self, sc: &Sidecar) -> Result<()> {
+        let tmp = self.sidecar_path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string(sc)?)?;
+        std::fs::rename(&tmp, &self.sidecar_path)?;
+        Ok(())
+    }
+}
+
+/// 下载主入口；成功返回最终文件路径。
+pub async fn download(task: DownloadTask, progress: Option<Arc<ProgressFn>>) -> Result<PathBuf> {
+    let started = std::time::Instant::now();
+    // 下载前先确定校验和：字段缺失时先取几 KB 的校验和文件，让"来源不可得"
+    // 在开头就暴露，而不是数百 MB 下完之后才失败。
+    let expected = resolve_expected(&task).await;
+    if expected.is_none() {
+        tracing::warn!(
+            dest = %task.dest_file.display(),
+            "无可用校验和（API 字段与校验和文件均不可得），跳过完整性校验"
+        );
+    }
+    if task.cancelled() {
+        return Err(Error::Cancelled);
+    }
+
+    if let Some(parent) = task.dest_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // 目标文件已存在：有校验和时验证通过才复用；无校验和时至少核对期望
+    // 大小，不符视为损坏/陈旧删除重下（否则截断文件会被永久复用）；大小
+    // 信息也缺失时只能复用（可能是上次跳过校验的下载）。
+    if task.dest_file.exists() {
+        match &expected {
+            Some(exp) => {
+                if sha256_file(&task.dest_file)
+                    .map(|a| a == *exp)
+                    .unwrap_or(false)
+                {
+                    return Ok(task.dest_file);
+                }
+                std::fs::remove_file(&task.dest_file).ok();
+            }
+            None => {
+                let size_ok = match task.expected_size {
+                    Some(sz) if sz > 0 => std::fs::metadata(&task.dest_file)
+                        .map(|m| m.len() == sz)
+                        .unwrap_or(false),
+                    _ => true,
+                };
+                if size_ok {
+                    return Ok(task.dest_file);
+                }
+                tracing::warn!(
+                    dest = %task.dest_file.display(),
+                    "已有文件大小与期望不符且无校验和，删除后重新下载"
+                );
+                std::fs::remove_file(&task.dest_file).ok();
+            }
+        }
+    }
+
+    let part = part_path(&task.dest_file);
+    let sidecar_path = sidecar_path(&task.dest_file);
+
+    let (total, ranges_ok, etag) = probe_source(&task).await.unwrap_or((0, false, None));
+
+    let existing = if sidecar_path.exists() && part.exists() {
+        load_sidecar(&sidecar_path)
+    } else {
+        None
+    };
+    let resumable = existing
+        .as_ref()
+        .is_some_and(|s| s.url == task.url && s.total == total && total > 0 && s.etag == etag);
+
+    let sidecar = match existing.filter(|_| resumable) {
+        Some(s) => s,
+        None if total > 0 => {
+            let chunks = plan_chunks(total, task.concurrency, ranges_ok);
+            // 全新任务：part 重建并预分配到最终大小。
+            let f = std::fs::File::create(&part)
+                .map_err(|e| Error::msg(format!("创建 {} 失败: {e}", part.display())))?;
+            f.set_len(total)
+                .map_err(|e| Error::msg(format!("预分配 {} 失败: {e}", part.display())))?;
+            f.sync_all()
+                .map_err(|e| Error::msg(format!("落盘 {} 失败: {e}", part.display())))?;
+            let sc = Sidecar {
+                url: task.url.clone(),
+                total,
+                etag: etag.clone(),
+                chunks,
+            };
+            write_sidecar(&sc, &sidecar_path)?;
+            sc
+        }
+        None => {
+            // 总长未知：单流下载，不支持续传；part 由下面统一打开前创建。
+            let sc = Sidecar {
+                url: task.url.clone(),
+                total: 0,
+                etag: None,
+                chunks: vec![ChunkState {
+                    start: 0,
+                    end: u64::MAX,
+                    done: 0,
+                }],
+            };
+            write_sidecar(&sc, &sidecar_path)?;
+            std::fs::File::create(&part)
+                .map_err(|e| Error::msg(format!("创建 {} 失败: {e}", part.display())))?;
+            sc
+        }
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&part)
+        .map_err(|e| Error::msg(format!("打开 {} 失败: {e}", part.display())))?;
+    let total_done = sidecar.chunks.iter().map(|c| c.done).sum();
+    tracing::info!(
+        url = %task.url,
+        dest = %task.dest_file.display(),
+        total,
+        chunks = sidecar.chunks.len(),
+        resumed = total_done > 0,
+        "开始下载"
+    );
+    let shared = Arc::new(Shared {
+        file: Mutex::new(file),
+        sidecar: Mutex::new(sidecar.clone()),
+        sidecar_path: sidecar_path.clone(),
+        total_done: AtomicU64::new(total_done),
+        progress,
+        total,
+    });
+    shared.report();
+
+    let mut handles = Vec::new();
+    for idx in 0..sidecar.chunks.len() {
+        let shared = Arc::clone(&shared);
+        let url = task.url.clone();
+        let client = task.client.clone();
+        let cancelled = task.cancel.clone();
+        handles.push(tokio::spawn(async move {
+            run_chunk(&client, &url, &shared, idx, cancelled).await
+        }));
+    }
+    for handle in handles {
+        handle
+            .await
+            .map_err(|e| Error::msg(format!("下载任务崩溃: {e}")))??;
+    }
+
+    shared.file.lock().unwrap().sync_all()?;
+
+    // 校验：有期望值才比对；来源不可得的情况入口已告警并跳过，
+    // 归档是否有效由安装阶段的 java -version 兜底。
+    if let Some(exp) = &expected {
+        let actual = sha256_file(&part)?;
+        if actual != *exp {
+            cleanup(&part, &sidecar_path);
+            return Err(Error::ChecksumMismatch {
+                expected: exp.clone(),
+                actual,
+            });
+        }
+    } else if let Some(sz) = task.expected_size.filter(|&s| s > 0) {
+        // 无校验和时用计划大小兜底：拦截「流中断被误判完成」等场景产出的
+        // 截断文件（有校验和的路径由上面的比对覆盖，无需重复检查大小）。
+        let actual = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+        if actual != sz {
+            cleanup(&part, &sidecar_path);
+            return Err(Error::msg(format!(
+                "下载不完整（{actual}/{sz} 字节）且来源无校验和，已丢弃断点"
+            )));
+        }
+    }
+
+    // 全部通过才落最终文件名。
+    if task.dest_file.exists() {
+        std::fs::remove_file(&task.dest_file)?;
+    }
+    std::fs::rename(&part, &task.dest_file)
+        .map_err(|e| Error::msg(format!("落位 {} → {} 失败: {e}", part.display(), task.dest_file.display())))?;
+    std::fs::remove_file(&sidecar_path).ok();
+    tracing::info!(
+        url = %task.url,
+        dest = %task.dest_file.display(),
+        bytes = shared.total_done.load(Ordering::Relaxed),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        verified = expected.is_some(),
+        "下载完成"
+    );
+    Ok(task.dest_file)
+}
+
+/// 执行单个分块：断点续传 + 停滞重试 + 取消检查。
+async fn run_chunk(
+    client: &reqwest::Client,
+    url: &str,
+    shared: &Shared,
+    idx: usize,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<()> {
+    let is_cancelled =
+        || cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
+    for attempt in 1..=MAX_ATTEMPTS {
+        if is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        // 总长未知（服务器不支持 Range/HEAD）时无法续传：非首次尝试且已有
+        // 部分数据时整档重来——不带 Range 头的重试会从服务端第 0 字节重发，
+        // 若沿用旧写偏移会把头部数据写到文件中段造成错位损坏。
+        {
+            let mut sc = shared.sidecar.lock().unwrap();
+            let c = &mut sc.chunks[idx];
+            if c.end == u64::MAX && c.done > 0 {
+                let dropped = c.done;
+                c.done = 0;
+                drop(sc);
+                shared.total_done.fetch_sub(dropped, Ordering::Relaxed);
+                shared.file.lock().unwrap().set_len(0)?;
+                shared.persist();
+            }
+        }
+        // 快照本块状态，决定 Range 头与本次写起点。
+        let snapshot = {
+            let sc = shared.sidecar.lock().unwrap();
+            let c = &sc.chunks[idx];
+            if c.done >= c.len() {
+                return Ok(());
+            }
+            (
+                c.end == u64::MAX,
+                c.start + c.done, // 本批网络数据要写的文件偏移
+                c.start > 0 || c.done > 0,
+            )
+        };
+        let (unknown_total, write_offset, resumed) = snapshot;
+
+        let mut req = client.get(url);
+        if !unknown_total {
+            let (start, end) = {
+                let sc = shared.sidecar.lock().unwrap();
+                let c = &sc.chunks[idx];
+                (c.start + c.done, c.end)
+            };
+            req = req.header(reqwest::header::RANGE, format!("bytes={start}-{end}"));
+        }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    chunk = idx,
+                    attempt,
+                    max = MAX_ATTEMPTS,
+                    error = %e,
+                    "分块请求失败，准备重试"
+                );
+                continue; // 网络抖动：重试
+            }
+        };
+        let status = resp.status();
+        if status == reqwest::StatusCode::OK && resumed && !unknown_total {
+            // 服务器无视 Range 返回 200：该源不支持续传，整档重来。
+            return Err(Error::msg("服务器不支持断点续传（对 Range 请求返回 200）"));
+        }
+        if !(status == reqwest::StatusCode::PARTIAL_CONTENT
+            || (status == reqwest::StatusCode::OK && !resumed))
+        {
+            // 4xx（限流除外）是确定性失败：链接失效/文件下架/无权限，
+            // 重试只是浪费，直接报出状态码。
+            if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(Error::msg(format!(
+                    "下载源返回 {status}，文件可能已下架或链接失效"
+                )));
+            }
+            continue;
+        }
+
+        let mut since_persist = 0u64;
+        let mut offset = write_offset;
+        let mut stream = resp.bytes_stream();
+        loop {
+            if is_cancelled() {
+                shared.persist();
+                return Err(Error::Cancelled);
+            }
+            let next = tokio::time::timeout(READ_TIMEOUT, stream.next()).await;
+            let Some(item) = next.ok() else {
+                // 读取停滞：保留断点，重试。
+                shared.persist();
+                break;
+            };
+            match item {
+                None => {
+                    // 流自然结束：未知总长时即为完成。
+                    if unknown_total {
+                        shared.persist();
+                        return Ok(());
+                    }
+                    shared.persist();
+                    break;
+                }
+                Some(Err(_)) => {
+                    shared.persist();
+                    break;
+                }
+                Some(Ok(bytes)) => {
+                    let n = bytes.len() as u64;
+                    {
+                        let mut f = shared.file.lock().unwrap();
+                        f.seek(SeekFrom::Start(offset))?;
+                        f.write_all(&bytes)?;
+                    }
+                    offset += n;
+                    {
+                        let mut sc = shared.sidecar.lock().unwrap();
+                        sc.chunks[idx].done += n;
+                    }
+                    shared.total_done.fetch_add(n, Ordering::Relaxed);
+                    since_persist += n;
+                    shared.report();
+                    if since_persist >= PERSIST_EVERY {
+                        shared.persist();
+                        since_persist = 0;
+                    }
+                }
+            }
+        }
+
+        // 流提前结束/停滞只算未完成：自然结束的路径已在上面 return Ok，
+        // 走到这里必须重试补齐（unknown_total 的 len 是 u64::MAX，恒为假，
+        // 会在下一轮尝试整档重来）。此前用 `unknown_total ||` 短路，会把
+        // 中断的残缺下载误判为完成，无校验和时截断文件直接落位。
+        let finished = {
+            let sc = shared.sidecar.lock().unwrap();
+            let c = &sc.chunks[idx];
+            c.done >= c.len()
+        };
+        if finished {
+            shared.persist();
+            return Ok(());
+        }
+        // 流提前结束：按断点重试补齐。
+    }
+    Err(Error::msg(format!(
+        "分块 {idx} 在 {MAX_ATTEMPTS} 次尝试后仍未完成"
+    )))
+}
+
+/// 计算分块计划：支持 Range 时按并发数均分，否则单块（未知总长）。
+fn plan_chunks(total: u64, concurrency: usize, ranges_ok: bool) -> Vec<ChunkState> {
+    if !ranges_ok {
+        return vec![ChunkState {
+            start: 0,
+            end: u64::MAX,
+            done: 0,
+        }];
+    }
+    let n = if total < MIN_CHUNKED_SIZE {
+        1
+    } else {
+        concurrency
+            .clamp(1, 16)
+            .min((total / MIN_CHUNK_SIZE).max(1) as usize)
+    };
+    let per = total / n as u64;
+    let mut chunks = Vec::with_capacity(n);
+    let mut start = 0u64;
+    for i in 0..n {
+        // 最后一块吞掉余数。
+        let end = if i == n - 1 {
+            total - 1
+        } else {
+            start + per - 1
+        };
+        chunks.push(ChunkState { start, end, done: 0 });
+        start = end + 1;
+    }
+    chunks
+}
+
+/// 探测总长与 Range 支持：先 HEAD，被拒（403/405 等）退化为 Range 0-0。
+async fn probe_source(task: &DownloadTask) -> Option<(u64, bool, Option<String>)> {
+    // 注意：hyper 客户端对 HEAD 响应的 resp.content_length() 恒为 0
+    // （报告的是 body 长度），必须直接读 Content-Length 头。
+    fn header_len(resp: &reqwest::Response) -> Option<u64> {
+        resp.headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    }
+
+    if let Ok(resp) = task.client.head(&task.url).send().await {
+        if resp.status().is_success() {
+            let ranges = resp
+                .headers()
+                .get(reqwest::header::ACCEPT_RANGES)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.contains("bytes"))
+                .unwrap_or(false);
+            let etag = etag_of(&resp);
+            if let Some(total) = header_len(&resp) {
+                return Some((total, ranges, etag));
+            }
+        }
+    }
+
+    // Range 0-0 探测：206 + Content-Range: bytes 0-0/<total>
+    let resp = task
+        .client
+        .get(&task.url)
+        .header(reqwest::header::RANGE, "bytes=0-0")
+        .send()
+        .await
+        .ok()?;
+    if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        let cr = resp
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)?
+            .to_str()
+            .ok()?;
+        let total = cr.rsplit('/').next()?.parse::<u64>().ok()?;
+        return Some((total, true, etag_of(&resp)));
+    }
+    None
+}
+
+fn etag_of(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+fn part_path(dest: &Path) -> PathBuf {
+    let mut name = file_name_of(dest);
+    name.push_str(".part");
+    dest.with_file_name(name)
+}
+
+fn sidecar_path(dest: &Path) -> PathBuf {
+    let mut name = file_name_of(dest);
+    name.push_str(".part.json");
+    dest.with_file_name(name)
+}
+
+fn file_name_of(p: &Path) -> String {
+    p.file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "download".to_string())
+}
+
+fn load_sidecar(path: &Path) -> Option<Sidecar> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn write_sidecar(sc: &Sidecar, path: &Path) -> Result<()> {
+    std::fs::write(path, serde_json::to_string(sc)?)?;
+    Ok(())
+}
+
+fn cleanup(part: &Path, sidecar: &Path) {
+    std::fs::remove_file(part).ok();
+    std::fs::remove_file(sidecar).ok();
+}
+
+/// 流式计算文件 SHA-256（1MiB 缓冲，~200MB 约 1s）。
+pub fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 清理下载目录里的过期断点文件（`*.part` / `*.part.json`）。
+///
+/// 取消/失败会保留断点供续传，但之后若不再重试同一版本，这些文件会
+/// 永久占据空间（一个中断的 JDK 包可达数百 MB）。在应用启动、CLI 命令
+/// 执行前调用：此时不可能有进行中的下载，按修改时间过期即删，返回
+/// 清理的文件数。
+pub fn clean_stale_parts(downloads_dir: &Path, max_age: Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(downloads_dir) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !name.ends_with(".part") && !name.ends_with(".part.json") {
+            continue;
+        }
+        let stale = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= max_age);
+        if stale && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::info!(
+            dir = %downloads_dir.display(),
+            removed,
+            ttl_hours = max_age.as_secs() / 3600,
+            "已清理过期的下载断点文件"
+        );
+    }
+    removed
+}
+
+/// 从 `.sha256.txt` 风格文本中提取首个 64 位十六进制校验和。
+pub fn parse_checksum_text(text: &str) -> Option<String> {
+    for token in text.split_whitespace() {
+        let t = token.trim().to_lowercase();
+        if t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(t);
+        }
+    }
+    None
+}
+
+async fn fetch_checksum_hex(client: &reqwest::Client, url: &str) -> Result<Option<String>> {
+    let resp = client.get(url).send().await?.error_for_status()?;
+    let text = resp.text().await?;
+    Ok(parse_checksum_text(&text))
+}
+
+/// 解析期望校验和：API 字段优先，其次 `.sha256.txt` 风格的校验和文件；
+/// 都不可得时返回 None（由调用方决定是否跳过校验继续下载）。
+async fn resolve_expected(task: &DownloadTask) -> Option<String> {
+    if let Some(e) = &task.expected_sha256 {
+        let e = e.trim().to_lowercase();
+        if !e.is_empty() {
+            return Some(e);
+        }
+    }
+    let url = task.checksum_url.as_deref()?;
+    match fetch_checksum_hex(&task.client, url).await {
+        Ok(Some(h)) => Some(h),
+        Ok(None) => {
+            tracing::warn!(url, "校验和文件内容中没有 64 位十六进制校验和");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                url,
+                error = %e,
+                "获取校验和文件失败，下载继续但跳过完整性校验"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn part_paths() {
+        let dest = PathBuf::from("/tmp/x/jdk.zip");
+        assert_eq!(part_path(&dest), PathBuf::from("/tmp/x/jdk.zip.part"));
+        assert_eq!(
+            sidecar_path(&dest),
+            PathBuf::from("/tmp/x/jdk.zip.part.json")
+        );
+    }
+
+    #[test]
+    fn chunk_planning() {
+        assert_eq!(plan_chunks(100, 8, false).len(), 1, "不支持 Range 用单块");
+
+        let chunks = plan_chunks(9 * 1024 * 1024, 2, true);
+        assert_eq!(chunks.len(), 1, "小于 16MiB 用单块");
+
+        let total = 33 * 1024 * 1024u64;
+        let chunks = plan_chunks(total, 4, true);
+        assert_eq!(chunks.len(), 4);
+        assert_eq!(chunks[0].start, 0);
+        assert_eq!(chunks[3].end, total - 1);
+        let sum: u64 = chunks.iter().map(|c| c.len()).sum();
+        assert_eq!(sum, total, "分块必须无缝覆盖全文件");
+
+        let one = plan_chunks(total, 1, true);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].len(), total);
+    }
+
+    #[test]
+    fn checksum_text_parsing() {
+        assert_eq!(
+            parse_checksum_text(
+                "e53a79c3c3d86865bd7e787903884331068e71321714ffd44f145785affc7cb0  jdk.zip\n"
+            ),
+            Some("e53a79c3c3d86865bd7e787903884331068e71321714ffd44f145785affc7cb0".into())
+        );
+        assert_eq!(parse_checksum_text("not a checksum"), None);
+    }
+
+    #[test]
+    fn sha256_of_small_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f.bin");
+        std::fs::write(&p, b"hello jvm").unwrap();
+        let h = sha256_file(&p).unwrap();
+        assert_eq!(h.len(), 64);
+        assert_eq!(sha256_file(&p).unwrap(), h, "同文件哈希稳定");
+    }
+
+    #[test]
+    fn sidecar_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let sc = Sidecar {
+            url: "https://example/x.zip".into(),
+            total: 100,
+            etag: Some("\"abc\"".into()),
+            chunks: vec![
+                ChunkState { start: 0, end: 49, done: 10 },
+                ChunkState { start: 50, end: 99, done: 0 },
+            ],
+        };
+        let p = dir.path().join("sc.json");
+        write_sidecar(&sc, &p).unwrap();
+        let loaded = load_sidecar(&p).unwrap();
+        assert_eq!(loaded.chunks[0].done, 10);
+        assert_eq!(loaded.etag.as_deref(), Some("\"abc\""));
+    }
+
+    #[test]
+    fn stale_part_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_part = dir.path().join("old.zip.part");
+        let old_sidecar = dir.path().join("old.zip.part.json");
+        let recent_part = dir.path().join("new.zip.part");
+        std::fs::write(&old_part, b"x").unwrap();
+        std::fs::write(&old_sidecar, b"x").unwrap();
+        std::fs::write(&recent_part, b"x").unwrap();
+
+        // 把 old 的修改时间拨到 TTL 之外
+        let past = std::time::SystemTime::now() - STALE_PART_TTL - std::time::Duration::from_secs(3600);
+        for p in [&old_part, &old_sidecar] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(past))
+                .unwrap();
+        }
+
+        assert_eq!(clean_stale_parts(dir.path(), STALE_PART_TTL), 2);
+        assert!(!old_part.exists() && !old_sidecar.exists());
+        assert!(recent_part.exists(), "TTL 内的断点保留用于续传");
+
+        // 非 .part/.part.json 文件不受影响，再次运行无事可做
+        std::fs::write(dir.path().join("done.zip"), b"x").unwrap();
+        assert_eq!(clean_stale_parts(dir.path(), STALE_PART_TTL), 0);
+        assert!(dir.path().join("done.zip").exists());
+        assert!(recent_part.exists());
+    }
+}

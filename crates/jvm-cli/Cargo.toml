@@ -1,0 +1,22 @@
+[package]
+name = "jvm-cli"
+description = "jdm 命令行：JDK 版本管理（ls/install/use/…）与 shim 自分发入口"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "jvm"
+path = "src/main.rs"
+
+[dependencies]
+jvm-core = { path = "../jvm-core" }
+clap = { version = "4", features = ["derive"] }
+tokio = { workspace = true }
+indicatif = "0.17"
+console = "0.15"
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
