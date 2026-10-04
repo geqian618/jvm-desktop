@@ -116,6 +116,13 @@ pub trait RegistrySource: Send + Sync {
         archive_type: &str,
     ) -> Result<Vec<Release>>;
 
+    /// 当前平台下确实有 GA JDK 包（任意归档格式）的发行商 api_name 列表，
+    /// 「所有版本」页据此从下拉框移除切过去必然空数据的发行商。
+    /// 返回空列表表示该源无法判定，调用方应保留全部发行商。
+    async fn platform_vendors(&self, _os: &str, _arch: &str) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     /// 某发行商某主版本的全部 GA 版本串（降序，仅版本号，无包详情）。
     async fn version_strings(&self, vendor: &str, feature: u32) -> Result<Vec<String>>;
 

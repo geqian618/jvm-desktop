@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { useAppStore } from "../stores/app";
 import { useDialogStore } from "../stores/dialog";
+import { api } from "../api";
 
 const { t } = useI18n();
 const store = useAppStore();
@@ -77,6 +78,14 @@ async function add() {
     newId.value = "";
   } catch (e) {
     store.log("error", `绑定失败: ${e}`);
+  }
+}
+
+async function open(path: string) {
+  try {
+    await api.openDir(path);
+  } catch (e) {
+    store.log("error", `打开目录失败: ${e}`);
   }
 }
 
@@ -205,6 +214,9 @@ onMounted(async () => {
               <td class="mono path" :title="p.path">{{ p.path }}</td>
               <td class="muted">{{ p.lastUsedAt.replace("T", " ").slice(0, 19) }}</td>
               <td class="actions">
+                <button class="btn-ghost btn-sm" @click="open(p.path)">
+                  {{ t("projects.open") }}
+                </button>
                 <button class="btn-danger btn-sm" @click="remove(p.path)">
                   {{ t("projects.unbind") }}
                 </button>
@@ -318,10 +330,19 @@ h2 {
 }
 
 .w-actions {
-  width: 110px;
+  width: 150px;
 }
 
 .actions {
   white-space: nowrap;
+}
+
+/* 行内按钮间距（与已安装页一致） */
+.actions .btn-sm {
+  margin-right: 6px;
+}
+
+.actions .btn-sm:last-child {
+  margin-right: 0;
 }
 </style>

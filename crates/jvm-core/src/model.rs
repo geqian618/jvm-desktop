@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 /// 全局唯一的 JDK 标识：`<vendor>@<version>`，如 `temurin@17.0.12+7`。
 ///
 /// 同一 version 可以来自多个发行商，vendor 参与唯一性；磁盘目录名由
-/// [`JdkId::to_dir_name`] 消毒生成。
+/// [`JdkId::to_dir_name`] 生成，与标识串保持一致。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct JdkId {
     pub vendor: String,
@@ -46,12 +46,14 @@ impl JdkId {
         })
     }
 
-    /// `versions/` 下的目录名：`+` 消毒为 `_`（Windows 路径不允许部分字符）。
+    /// `versions/` 下的目录名与下载归档文件名基底：`vendor@version` 原样
+    /// 保留（`@`、`+` 在 Windows/macOS/Linux 文件名中都合法），仅兜底替换
+    /// 个别非法字符，保证磁盘命名与列表展示的标识串一致。
     pub fn to_dir_name(&self) -> String {
         let sanitize = |s: &str| -> String {
             s.chars()
                 .map(|c| {
-                    if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                    if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@' | '+') {
                         c
                     } else {
                         '_'
@@ -59,7 +61,7 @@ impl JdkId {
                 })
                 .collect()
         };
-        format!("{}_{}", sanitize(&self.vendor), sanitize(&self.version))
+        format!("{}@{}", sanitize(&self.vendor), sanitize(&self.version))
     }
 }
 
@@ -255,14 +257,19 @@ mod tests {
     }
 
     #[test]
-    fn dir_name_sanitizes_plus() {
+    fn dir_name_keeps_safe_chars() {
+        // `@` 与 `+` 原样保留，磁盘目录名与标识串一致
         assert_eq!(
             JdkId::parse("temurin@17.0.12+7").unwrap().to_dir_name(),
-            "temurin_17.0.12_7"
+            "temurin@17.0.12+7"
         );
         assert_eq!(
             JdkId::parse("zulu@25.0.1+8").unwrap().to_dir_name(),
-            "zulu_25.0.1_8"
+            "zulu@25.0.1+8"
+        );
+        assert_eq!(
+            JdkId::new("graalvm_community", "25-ea+9").to_dir_name(),
+            "graalvm_community@25-ea+9"
         );
     }
 
@@ -308,13 +315,5 @@ mod tests {
         assert!(VersionRef::parse("17.0.12+7").matches("17.0.12+7"));
         let upper: String = "17.0.12+7".to_uppercase();
         assert!(VersionRef::parse("17.0.12+7").matches(&upper));
-    }
-
-    #[test]
-    fn dir_name_keeps_safe_chars() {
-        assert_eq!(
-            JdkId::new("graalvm_community", "25-ea+9").to_dir_name(),
-            "graalvm_community_25-ea+9".replace('+', "_")
-        );
     }
 }

@@ -284,6 +284,30 @@ async fn get_major_versions(state: State<'_, SharedState>) -> Result<Vec<MajorVe
     Ok(list)
 }
 
+/// 当前平台下有 GA JDK 包的发行商 api_name 列表（发行商下拉框过滤用）。
+/// 返回空列表表示该源无法判定，前端保留全部发行商。
+#[tauri::command]
+async fn get_available_vendors(
+    operating_system: String,
+    architecture: String,
+) -> Result<Vec<String>, String> {
+    let home = app_home()?;
+    let settings = store::load_settings(&home).map_err(estr)?;
+    let vendors = from_settings(&settings)
+        .map_err(estr)?
+        .platform_vendors(&operating_system, &architecture)
+        .await
+        .map_err(estr)?;
+    tracing::info!(
+        os = %operating_system,
+        arch = %architecture,
+        n = vendors.len(),
+        has_bisheng = vendors.iter().any(|v| v == "bisheng"),
+        "平台可用发行商探测完成"
+    );
+    Ok(vendors)
+}
+
 /// 一次拉取该发行商在当前平台/归档格式下的全部 GA 包（不带 version 参数）。
 #[tauri::command]
 async fn get_all_releases(
@@ -435,7 +459,7 @@ async fn uninstall_jdk(app: AppHandle, dir: String) -> Result<(), String> {
 async fn open_dir(app: AppHandle, path: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
     app.opener()
-        .reveal_item_in_dir(&path)
+        .open_path(&path, None::<&str>)
         .map_err(estr)
 }
 
@@ -819,6 +843,7 @@ pub fn run() {
             get_default_paths,
             get_distributions,
             get_major_versions,
+            get_available_vendors,
             get_all_releases,
             get_local_jdks,
             get_current_java_home,

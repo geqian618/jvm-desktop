@@ -11,8 +11,8 @@ const dialog = useDialogStore();
 const supportType = ref("");
 
 // 标记已安装：按索引记录 id（vendor@version）与包 id 匹配。
-// 不按目录名匹配——CLI 与 GUI 的安装目录名策略不同（下划线消毒 vs 原样
-// `+`），按目录名会让 CLI 装的版本显示"未安装"，再点安装报"已安装"。
+// CLI 与 GUI 的安装目录名策略一致（都是 vendor@version），但匹配仍按
+// 索引 id——目录名只是展示值，外部导入的目录名可以是任意的。
 const installedIds = computed(
   () =>
     new Set(
@@ -170,22 +170,13 @@ function vendorName(r: ReleaseInfo): string {
     </div>
 
     <div v-else class="table-scroll">
-      <table class="table table-fixed">
-      <colgroup>
-        <col class="col-version" />
-        <col class="col-dist" />
-        <col class="col-vendor" />
-        <col class="col-file" />
-        <col class="col-type" />
-        <col class="col-size" />
-        <col class="col-actions" />
-      </colgroup>
+      <table class="table">
       <thead>
         <tr>
+          <th>{{ t("available.colName") }}</th>
+          <th>{{ t("available.colVendor") }}</th>
           <th>{{ t("available.colVersion") }}</th>
           <th>{{ t("available.colDistVersion") }}</th>
-          <th>{{ t("available.colVendor") }}</th>
-          <th>{{ t("available.colFile") }}</th>
           <th>{{ t("available.colType") }}</th>
           <th>{{ t("available.colSize") }}</th>
           <th>{{ t("available.colAction") }}</th>
@@ -193,14 +184,14 @@ function vendorName(r: ReleaseInfo): string {
       </thead>
       <tbody>
         <tr v-for="r in sortedReleases" :key="r.id">
-          <td class="mono">{{ r.javaVersion }}</td>
-          <td class="muted">{{ r.distributionVersion || "-" }}</td>
+          <td class="mono name-cell" :title="r.id">
+            {{ r.distribution }}@{{ r.javaVersion }}
+          </td>
           <td class="dist-cell">
             <span :title="vendorName(r)">{{ vendorName(r) }}</span>
           </td>
-          <td class="file-cell">
-            <span class="mono" :title="r.filename">{{ r.filename }}</span>
-          </td>
+          <td class="mono">{{ r.javaVersion }}</td>
+          <td class="muted">{{ r.distributionVersion || "-" }}</td>
           <td>
             <span v-if="isLts(parseInt(r.javaVersion, 10))" class="pill pill-ok">LTS</span>
             <span v-else class="muted">{{ supportLabel(r.termOfSupport) }}</span>
@@ -217,6 +208,9 @@ function vendorName(r: ReleaseInfo): string {
                 </span>
                 <span class="dl-text">
                   {{ t("available.downloading") }} {{ progressOf(r)!.percent.toFixed(0) }}%
+                  <span v-if="progressOf(r)!.speed" class="muted">
+                    · {{ formatSize(progressOf(r)!.speed ?? 0) }}/s
+                  </span>
                 </span>
                 <button class="btn-ghost btn-sm" @click="store.cancelTask(r.id)">
                   {{ t("common.cancel") }}
@@ -272,45 +266,36 @@ function vendorName(r: ReleaseInfo): string {
 </template>
 
 <style scoped>
-/* 固定列宽：某一行进入下载/安装状态（内容变宽）时其它列不受影响 */
-.table-fixed {
-  table-layout: fixed;
+/* 纯自适应（浏览器自动布局）：各列宽度由内容决定，表格铺满容器时
+   富余宽度按各列内容宽度比例分摊——空白均匀、任何内容都不截断。
+   全表不换行：折行会让列被压向最小宽度，出现 "370.8 MB" 断成两行；
+   内容总宽超出窗口时由 table-scroll 横向滚动兜底 */
+.table th,
+.table td {
+  white-space: nowrap;
 }
 
-.col-version {
-  width: 110px;
+/* 名称列锁在内容最大宽度附近，避免按比例分摊时它作为最宽列
+   摊走过多富余宽度；超长的值截断省略，悬停 title 可看全名 */
+.name-cell {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.col-dist {
-  width: 100px;
+/* 操作列锁定宽度：自动布局下，下载进度文本每次刷新都会改变该列
+   的内容宽度，导致整表列宽重排（即「抖动」）；锁定后阶段切换、
+   百分比/速度变化只在列内消化，其它列纹丝不动 */
+.actions {
+  width: 260px;
 }
 
-.col-vendor {
-  width: 150px;
-}
-
-/* 文件列也给基准宽度：fixed 布局下所有列都有宽时，窗口多余宽度
-   按比例摊给各列，避免全部空白集中在一列里 */
-.col-file {
-  width: 360px;
-}
-
-.col-type {
-  width: 70px;
-}
-
-.col-size {
-  width: 90px;
-}
-
-.col-actions {
-  width: 200px;
-}
-
-/* 下载中一行：进度条弹性填充剩余宽度，避免操作列留大片空白 */
+/* 行高恒定：空闲(两个按钮)与下载中(进度行)强制等高并统一垂直居中。
+   两者都是 inline 盒但基线规则不同——按钮取文字基线，inline-flex 取
+   首个子元素的基线，切换瞬间行盒高度差几像素就是「抖一下」的根源 */
+/* 下载中一行：进度条弹性填充操作列剩余宽度；display/align 由
+   .actions > * 统一提供，这里只补进度行内部的子元素间距 */
 .dl-row {
-  display: inline-flex;
-  align-items: center;
   gap: 6px;
   width: 100%;
 }
@@ -325,20 +310,6 @@ function vendorName(r: ReleaseInfo): string {
 .dl-text {
   white-space: nowrap;
   font-size: 12px;
-}
-
-/* 固定布局下列宽受限，长文件名截断显示 */
-.file-cell {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* 厂商名同样可能较长（Eclipse Temurin / GraalVM Community 等） */
-.dist-cell {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .page-header {
@@ -431,11 +402,15 @@ h2 {
   user-select: text;
 }
 
-.actions {
-  white-space: nowrap;
-}
-
+/* 行高恒定：操作列所有直接子元素（按钮组 / 进度行 / 准备中·完成·
+   失败等状态文本）统一 28px 等高、垂直居中。状态文本是行内 span，
+   height 不生效，必须先转 inline-flex；否则「按钮 → 文字」切换的
+   瞬间文字撑不起高度，整行会缩一下 */
 .actions > * {
+  display: inline-flex;
+  align-items: center;
+  height: 28px;
+  vertical-align: middle;
   margin-right: 8px;
 }
 
@@ -475,9 +450,5 @@ h2 {
   color: var(--accent);
   border-color: rgba(47, 111, 237, 0.35);
   background: rgba(47, 111, 237, 0.06);
-}
-
-.col-type {
-  width: 80px;
 }
 </style>

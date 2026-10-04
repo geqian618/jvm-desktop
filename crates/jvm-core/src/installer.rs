@@ -358,7 +358,7 @@ mod tests {
 
         let id = JdkId::parse("temurin@17.0.12+7").unwrap();
         let out = install_from_archive(&archive, &id, &home, &stub_verifier(true)).unwrap();
-        assert_eq!(out.dir_name, "temurin_17.0.12_7");
+        assert_eq!(out.dir_name, "temurin@17.0.12+7");
         let dest = home.version_dir(&id);
         assert!(dest.join("bin").join(exe_name("java")).is_file(), "根目录应被剥离");
         assert!(dest.join("release").is_file());
@@ -418,7 +418,7 @@ mod tests {
 
         let id = JdkId::parse("zulu@25.0.1+8").unwrap();
         let out = install_from_archive(&tar_gz, &id, &home, &stub_verifier(true)).unwrap();
-        assert_eq!(out.dir_name, "zulu_25.0.1_8");
+        assert_eq!(out.dir_name, "zulu@25.0.1+8");
         assert!(home.version_dir(&id).join("bin").join(exe_name("java")).is_file());
     }
 
@@ -443,7 +443,7 @@ mod tests {
 
         let id = JdkId::parse("corretto@11.0.24+8").unwrap();
         let out = import_directory(&src, &id, &home, &stub_verifier(true)).unwrap();
-        assert_eq!(out.dir_name, "corretto_11.0.24_8");
+        assert_eq!(out.dir_name, "corretto@11.0.24+8");
         assert!(home.version_dir(&id).join("bin").join(exe_name("java")).is_file());
         // 原目录保持不动
         assert!(src.join("bin").join(exe_name("java")).is_file());

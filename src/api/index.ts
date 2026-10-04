@@ -17,6 +17,8 @@ export const api = {
   getDefaultPaths: () => invoke<PathDefaults>("get_default_paths"),
   getDistributions: () => invoke<DistributionInfo[]>("get_distributions"),
   getMajorVersions: () => invoke<MajorVersion[]>("get_major_versions"),
+  getAvailableVendors: (operatingSystem: string, architecture: string) =>
+    invoke<string[]>("get_available_vendors", { operatingSystem, architecture }),
   getAllReleases: (
     distribution: string,
     operatingSystem: string,

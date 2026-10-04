@@ -10,6 +10,12 @@ const { t } = useI18n();
 const store = useAppStore();
 const dialog = useDialogStore();
 
+// 与项目关联页保持一致：内部已登记的 JDK 显示规范 id（vendor@version，
+// 即 .jvmrc 内容），外部导入（id 为 external@哈希）或未登记的目录显示名称
+function displayName(jdk: LocalJdk): string {
+  return jdk.id && !jdk.id.startsWith("external@") ? jdk.id : jdk.name;
+}
+
 async function removeJdk(jdk: LocalJdk) {
   // 预检占用：默认版本或被项目关联时直接弹窗说明原因，不发卸载请求
   await store.refreshProjects();
@@ -18,10 +24,14 @@ async function removeJdk(jdk: LocalJdk) {
     .map((p) => p.name);
   if (jdk.isCurrent || boundBy.length > 0) {
     const reasons: string[] = [];
-    if (jdk.isCurrent) reasons.push(t("installed.blockedDefault", { name: jdk.name }));
+    if (jdk.isCurrent)
+      reasons.push(t("installed.blockedDefault", { name: displayName(jdk) }));
     if (boundBy.length > 0)
       reasons.push(
-        t("installed.blockedProjects", { name: jdk.name, projects: boundBy.join("、") }),
+        t("installed.blockedProjects", {
+          name: displayName(jdk),
+          projects: boundBy.join("、"),
+        }),
       );
     await dialog.alert({
       title: t("installed.uninstall"),
@@ -93,7 +103,7 @@ onMounted(() => store.refreshLocal());
       <tbody>
         <tr v-for="jdk in store.localJdks" :key="jdk.dir">
           <td class="w-name">
-            <span class="name">{{ jdk.name }}</span>
+            <span class="name">{{ displayName(jdk) }}</span>
           </td>
           <td>
             <span class="mono">{{
@@ -211,7 +221,7 @@ h2 {
 }
 
 .w-actions {
-  width: 250px;
+  width: 210px;
 }
 
 .actions {

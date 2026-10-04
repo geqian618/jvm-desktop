@@ -277,7 +277,9 @@ mod tests {
     #[test]
     fn write_shims_copies_current_exe() {
         let (_d, home) = tmp_home();
-        let written = write_shims(&home).unwrap();
+        // 用注入源的变体：write_shims 会优先取同目录的 jvm.exe（jvm-cli
+        // 构建产物与测试二进制同在 deps/），导致拷贝源与断言对象不一致
+        let written = write_shims_from(&std::env::current_exe().unwrap(), &home).unwrap();
         // 7 个工具中至少 6 个（java/jar/jshell 等与本进程文件名不同）被写入
         assert!(written.len() >= SHIM_TOOLS.len() - 1);
         let java_shim = home.bin().join(exe_name("java"));

@@ -27,6 +27,12 @@ interface Filters {
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let persistWatcherBound = false;
 
+/** 每个下载任务的速度估算状态：样本窗口 + 每秒才刷新一次的显示值 */
+const speedTrackers = new Map<
+  string,
+  { samples: { ts: number; downloaded: number }[]; display: number; lastCalc: number }
+>();
+
 /** 设置兜底默认值（config 加载失败等极端场景） */
 export const CONFIG_FALLBACK: AppConfig = {
   language: "zh-CN",
@@ -197,7 +203,31 @@ export const useAppStore = defineStore("app", {
 
       await listen<InstallProgress>("install-progress", (event) => {
         const p = event.payload;
-        this.installStates[p.taskId] = p;
+        if (p.stage === "download") {
+          // 速度估算：进度事件 10 条/秒，若每条都重算显示值，数字一秒会跳
+          // 好几次。样本按事件收集（保准确），但显示值每 1s 才按最近 5s
+          // 的滑动窗口重算一次——数字 1 秒最多变一次，数值是真实平均速率。
+          // 重连空档期没有事件，恢复后首个样本按真实时间差计入，不含水分。
+          const now = Date.now();
+          const tr =
+            speedTrackers.get(p.taskId) ?? { samples: [], display: 0, lastCalc: 0 };
+          tr.samples.push({ ts: now, downloaded: p.downloaded });
+          while (tr.samples.length > 2 && now - tr.samples[0].ts > 5000) {
+            tr.samples.shift();
+          }
+          if (now - tr.lastCalc >= 1000) {
+            tr.lastCalc = now;
+            const first = tr.samples[0];
+            if (now > first.ts && p.downloaded >= first.downloaded) {
+              tr.display = ((p.downloaded - first.downloaded) * 1000) / (now - first.ts);
+            }
+          }
+          speedTrackers.set(p.taskId, tr);
+          this.installStates[p.taskId] = { ...p, speed: tr.display };
+        } else {
+          speedTrackers.delete(p.taskId);
+          this.installStates[p.taskId] = p;
+        }
         if (p.stage === "done") {
           this.refreshLocal();
           this.refreshDownloaded();
@@ -246,16 +276,34 @@ export const useAppStore = defineStore("app", {
         ]);
         this.distributions = distributions;
         this.majorVersions = majorVersions;
+        // 过滤当前平台下没有任何 GA JDK 包的发行商（如 bisheng 只发 Linux 包，
+        // 切过去必然空数据）。探测失败或结果为空（镜像源不支持该查询、
+        // adoptium 等单发行商源）时保留全部，宁可多显示也不误删。
+        try {
+          const vendors = await api.getAvailableVendors(
+            this.foojayOs,
+            this.foojayArch,
+          );
+          const filtered = this.distributions.filter((d) =>
+            vendors.includes(d.apiName),
+          );
+          if (filtered.length > 0) {
+            this.distributions = filtered;
+          }
+        } catch (e) {
+          // error 级会转发进后端日志文件，便于排查探测在真机上的实际表现
+          this.log("error", `平台可用发行商探测失败，保留全部: ${e}`);
+        }
         this.log(
           "info",
-          `数据源加载完成：${this.distributions.length} 个发行版 / ${this.majorVersions.length} 个大版本`,
+          `数据源加载完成：${this.distributions.length} 个发行商 / ${this.majorVersions.length} 个大版本`,
         );
       } catch (e) {
         this.registryError = String(e);
         this.log("error", `加载数据源元数据失败: ${e}`);
         return;
       }
-      // 默认选中：第一个发行版；大版本默认「全部」
+      // 默认选中：列表第一个发行商；大版本默认「全部」
       if (!this.filters.vendor && this.distributions.length > 0) {
         this.filters.vendor = this.distributions[0].apiName;
       }
@@ -293,7 +341,8 @@ export const useAppStore = defineStore("app", {
     },
 
     async install(release: ReleaseInfo) {
-      const dirName = `${release.distribution}-${release.javaVersion}`;
+      // 安装目录名与下载文件名统一用 vendor@version（与列表名称列一致）
+      const dirName = `${release.distribution}@${release.javaVersion}`;
       try {
         await api.installJdk(release, dirName);
       } catch (e) {

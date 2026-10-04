@@ -73,7 +73,13 @@ export interface ProjectEntry {
   lastUsedAt: string;
 }
 
-export type InstallStage = "download" | "extract" | "done" | "error" | "cancelled";
+export type InstallStage =
+  | "prepare"
+  | "download"
+  | "extract"
+  | "done"
+  | "error"
+  | "cancelled";
 
 export type LogLevel = "info" | "success" | "warn" | "error";
 
@@ -90,6 +96,8 @@ export interface InstallProgress {
   total: number;
   percent: number;
   message: string;
+  /** 实时下载速度（B/s）：前端按进度事件差分 + EMA 平滑估算，仅 download 阶段有值 */
+  speed?: number;
 }
 
 export interface Platform {

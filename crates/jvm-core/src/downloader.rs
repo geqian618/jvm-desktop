@@ -6,6 +6,9 @@
 //! 2. HEAD / Range-0-0 探测总长度与 Range 支持；
 //! 3. 支持 Range 且文件较大时按 `concurrency` 分块，每块独立 Range 请求，
 //!    进度持久化到 `<dest>.part.json` 边车文件，重试/续传按块推进；
+//!    CDN/运营商常在连接存活一段时间后限速（表现为越下越慢直到每秒几十
+//!    KB），分块按滑动窗口测速，均速跌破自身峰值的 1/4 即断开重连换回
+//!    突发带宽；
 //! 4. 完成后流式计算整文件 SHA-256 并比对，通过后才把 `.part` 原子改名
 //!    为最终文件——任何失败都不会产生半成品。
 //!
@@ -20,7 +23,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -32,14 +35,32 @@ use crate::error::{Error, Result};
 pub type ProgressFn = dyn Fn(u64, u64) + Send + Sync;
 
 /// 单块读取停滞超时：超过则中断本次请求，按断点重试。
-const READ_TIMEOUT: Duration = Duration::from_secs(60);
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// 等待响应头的超时：服务器接受连接后不回数据（连接被服务端掐住半死
+/// 不活）时，`req.send()` 没有这个超时会永久挂起——进度不走、取消也
+/// 无响应的"卡死"就是它。超时按普通可重试失败处理。
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// 速率测量滑动窗口：窗口均速与历史峰值比较，判断连接是否被限速。
+const RATE_WINDOW: Duration = Duration::from_secs(15);
+/// 峰值速率门槛（B/s）：本块峰值低于该值时不做"衰减判定"——只有
+/// "曾经快过、现在明显变慢"才是限速信号。注意分块是按并发均分线路的，
+/// 门槛必须低于单块的典型峰值（如 1-2MB/s 线路 16 分块下单块峰值仅
+/// 60-125KB/s），定高了看门狗永远不触发，限速块会一路爬到底。
+const RATE_PEAK_MIN_BPS: u64 = 64 * 1024;
+/// 限速重连的冷却时间：重连本身有代价（TCP 慢启动重来），同一块两次
+/// 重连至少间隔这么久。取值不能太大——部分下载源对"长连接"降速极狠
+/// （新连接能跑满、老连接掉到几 KB/s），轮换是唯一的续命手段。
+const RECONNECT_COOLDOWN: Duration = Duration::from_secs(20);
+/// 剩余不足该字节数就不再重连：为几十 KB 的尾巴重建连接得不偿失。
+const MIN_RECONNECT_REMAINING: u64 = 1024 * 1024;
 /// 每块进度落盘间隔（字节）。
 const PERSIST_EVERY: u64 = 4 * 1024 * 1024;
 /// 文件不小于该值才启用多块并发。
 const MIN_CHUNKED_SIZE: u64 = 16 * 1024 * 1024;
 /// 每块最小 4MiB，避免小块过多。
 const MIN_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
-/// 单块最大尝试次数。
+/// 单块连续无进展尝试的上限：任何收到数据的尝试都会清零计数，
+/// 限速重连因此不消耗预算（详见 [`run_chunk`] 文档）。
 const MAX_ATTEMPTS: u32 = 5;
 /// 下载断点（*.part / *.part.json）的保留时长：取消/失败保留断点用于续传，
 /// 超过此时长仍未重试即视为垃圾，由 [`clean_stale_parts`] 回收。
@@ -61,6 +82,55 @@ pub struct DownloadTask {
     pub concurrency: usize,
     /// 取消开关：置 true 后各分块尽快中断（GUI 的取消按钮）。
     pub cancel: Option<Arc<AtomicBool>>,
+}
+
+/// 限速看门狗：滑动窗口均速 vs 本块历史峰值，判定连接是否被限速。
+///
+/// CDN/运营商对存活一段时间的长连接限速，表现为"越下越慢"——连接仍在
+/// 滴数据，停滞超时与流错误都不会触发，唯有主动断开重连（按断点续传）
+/// 才能换回新连接的突发带宽。判定用相对峰值而非绝对下限：线路本身慢时
+/// 均速≈峰值，重连毫无收益；只有"曾经快过、现在明显变慢"才是限速信号。
+struct RateWatchdog {
+    window_start: Instant,
+    window_bytes: u64,
+    peak_bps: u64,
+}
+
+impl RateWatchdog {
+    fn new() -> Self {
+        Self {
+            window_start: Instant::now(),
+            window_bytes: 0,
+            peak_bps: 0,
+        }
+    }
+
+    /// 累计一次收到的字节；到窗口边界时判定。返回 `Some(当前速率)` 表示
+    /// 均速已跌破峰值的 1/4（且峰值达到门槛），建议断开重连——调用方可
+    /// 依据冷却/上限否决，否决后调用 [`Self::reset_window`] 继续用当前连接。
+    fn on_bytes(&mut self, n: u64, now: Instant) -> Option<u64> {
+        self.window_bytes += n;
+        let elapsed = now.duration_since(self.window_start);
+        if elapsed < RATE_WINDOW {
+            return None;
+        }
+        let bps = self.window_bytes * 1000 / elapsed.as_millis().max(1) as u64;
+        if bps > self.peak_bps {
+            self.peak_bps = bps;
+        }
+        if self.peak_bps >= RATE_PEAK_MIN_BPS && bps * 4 < self.peak_bps {
+            return Some(bps);
+        }
+        self.window_bytes = 0;
+        self.window_start = now;
+        None
+    }
+
+    /// 丢弃当前窗口的累计（峰值保留），从现在起重新计时。
+    fn reset_window(&mut self, now: Instant) {
+        self.window_bytes = 0;
+        self.window_start = now;
+    }
 }
 
 impl DownloadTask {
@@ -265,11 +335,55 @@ pub async fn download(task: DownloadTask, progress: Option<Arc<ProgressFn>>) -> 
             run_chunk(&client, &url, &shared, idx, cancelled).await
         }));
     }
+    // 取消监视：cancel 置位后立刻 abort 全部分块任务。协同取消要等每个
+    // await 点自己检查标志，任务若卡在无响应的请求上，取消会迟迟不生效；
+    // abort 直接拆任务，连接随之关闭，取消按钮立即生效。
+    let cancel_watcher = task.cancel.clone().map(|flag| {
+        let aborts: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
+        tokio::spawn(async move {
+            loop {
+                if flag.load(Ordering::Relaxed) {
+                    for a in aborts {
+                        a.abort();
+                    }
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+    });
+
+    // 任一分块失败即叫停其余分块（半成品只存在于 .part，最终文件不受影响）。
+    let abort_all: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
+    let mut outcome: Result<()> = Ok(());
     for handle in handles {
-        handle
-            .await
-            .map_err(|e| Error::msg(format!("下载任务崩溃: {e}")))??;
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                outcome = Err(e);
+                break;
+            }
+            Err(e) if e.is_cancelled() => {
+                outcome = Err(Error::Cancelled);
+                break;
+            }
+            Err(e) => {
+                outcome = Err(Error::msg(format!("下载任务崩溃: {e}")));
+                break;
+            }
+        }
     }
+    if outcome.is_err() {
+        for a in &abort_all {
+            a.abort();
+        }
+        // abort 会跳过分块自己的收尾落盘，这里补一次，保住已下载的断点。
+        shared.persist();
+    }
+    if let Some(w) = cancel_watcher {
+        w.abort();
+    }
+    outcome?;
 
     shared.file.lock().unwrap().sync_all()?;
 
@@ -314,7 +428,11 @@ pub async fn download(task: DownloadTask, progress: Option<Arc<ProgressFn>>) -> 
     Ok(task.dest_file)
 }
 
-/// 执行单个分块：断点续传 + 停滞重试 + 取消检查。
+/// 执行单个分块：断点续传 + 停滞重试 + 低速重连 + 取消检查。
+///
+/// 重试预算只计「连续无进展失败」：任何一次尝试只要收到过数据就把计数
+/// 清零。限速重连（看门狗）每次都带着进展，不消耗预算——一次长下载可能
+/// 重连十几轮，若沿用总次数上限会在中途误报失败。
 async fn run_chunk(
     client: &reqwest::Client,
     url: &str,
@@ -324,7 +442,11 @@ async fn run_chunk(
 ) -> Result<()> {
     let is_cancelled =
         || cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
-    for attempt in 1..=MAX_ATTEMPTS {
+    let mut hard_failures = 0u32;
+    // 限速重连的冷却锚点（跨尝试保留）：重连只在"深衰减 + 冷却到期 +
+    // 剩余量足够"时发生，频率由冷却时间自然限制，不需要硬上限。
+    let mut last_reconnect: Option<Instant> = None;
+    loop {
         if is_cancelled() {
             return Err(Error::Cancelled);
         }
@@ -354,9 +476,10 @@ async fn run_chunk(
                 c.end == u64::MAX,
                 c.start + c.done, // 本批网络数据要写的文件偏移
                 c.start > 0 || c.done > 0,
+                c.len().saturating_sub(c.done),
             )
         };
-        let (unknown_total, write_offset, resumed) = snapshot;
+        let (unknown_total, write_offset, resumed, remaining) = snapshot;
 
         let mut req = client.get(url);
         if !unknown_total {
@@ -367,17 +490,37 @@ async fn run_chunk(
             };
             req = req.header(reqwest::header::RANGE, format!("bytes={start}-{end}"));
         }
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
+        let resp = match tokio::time::timeout(RESPONSE_TIMEOUT, req.send()).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 tracing::warn!(
                     chunk = idx,
-                    attempt,
+                    failures = hard_failures + 1,
                     max = MAX_ATTEMPTS,
                     error = %e,
                     "分块请求失败，准备重试"
                 );
+                hard_failures += 1;
+                if hard_failures >= MAX_ATTEMPTS {
+                    break;
+                }
                 continue; // 网络抖动：重试
+            }
+            // 等响应头超时：服务器收了连接不吐数据。按可重试失败处理，
+            // 否则任务会永久挂起——进度不动、取消也无响应。
+            Err(_) => {
+                tracing::warn!(
+                    chunk = idx,
+                    timeout_s = RESPONSE_TIMEOUT.as_secs(),
+                    failures = hard_failures + 1,
+                    max = MAX_ATTEMPTS,
+                    "等待响应头超时，准备重试"
+                );
+                hard_failures += 1;
+                if hard_failures >= MAX_ATTEMPTS {
+                    break;
+                }
+                continue;
             }
         };
         let status = resp.status();
@@ -395,10 +538,18 @@ async fn run_chunk(
                     "下载源返回 {status}，文件可能已下架或链接失效"
                 )));
             }
+            hard_failures += 1;
+            if hard_failures >= MAX_ATTEMPTS {
+                break;
+            }
             continue;
         }
 
         let mut since_persist = 0u64;
+        let mut attempt_bytes = 0u64;
+        // 限速看门狗：仅对支持 Range 的块生效（未知总长时重连等于整档
+        // 重来，反而越重连越慢）。断点已落盘，续传无损。
+        let mut watchdog = RateWatchdog::new();
         let mut offset = write_offset;
         let mut stream = resp.bytes_stream();
         loop {
@@ -440,10 +591,32 @@ async fn run_chunk(
                     }
                     shared.total_done.fetch_add(n, Ordering::Relaxed);
                     since_persist += n;
+                    attempt_bytes += n;
                     shared.report();
                     if since_persist >= PERSIST_EVERY {
                         shared.persist();
                         since_persist = 0;
+                    }
+                    // 低速看门狗：窗口均速跌破峰值 1/4 才建议重连，且受
+                    // 冷却与剩余量约束。
+                    if !unknown_total {
+                        if let Some(bps) = watchdog.on_bytes(n, Instant::now()) {
+                            let cooled = last_reconnect
+                                .map_or(true, |t| t.elapsed() >= RECONNECT_COOLDOWN);
+                            if cooled && remaining > MIN_RECONNECT_REMAINING {
+                                last_reconnect = Some(Instant::now());
+                                tracing::info!(
+                                    chunk = idx,
+                                    rate_kb = bps / 1024,
+                                    peak_kb = watchdog.peak_bps / 1024,
+                                    "分块疑似被限速，断开重连（按断点续传）"
+                                );
+                                shared.persist();
+                                break;
+                            }
+                            // 否决重连：重置窗口继续用当前连接慢慢爬。
+                            watchdog.reset_window(Instant::now());
+                        }
                     }
                 }
             }
@@ -462,10 +635,19 @@ async fn run_chunk(
             shared.persist();
             return Ok(());
         }
+        // 有进展（含限速重连）则连续失败计数清零；一无所获才算一次硬失败。
+        if attempt_bytes > 0 {
+            hard_failures = 0;
+        } else {
+            hard_failures += 1;
+            if hard_failures >= MAX_ATTEMPTS {
+                break;
+            }
+        }
         // 流提前结束：按断点重试补齐。
     }
     Err(Error::msg(format!(
-        "分块 {idx} 在 {MAX_ATTEMPTS} 次尝试后仍未完成"
+        "分块 {idx} 连续 {MAX_ATTEMPTS} 次尝试无进展，仍未完成"
     )))
 }
 
@@ -693,6 +875,49 @@ async fn resolve_expected(task: &DownloadTask) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 把 N KB 喂给一个窗口并推进到窗口末尾，模拟一段时间内的传输。
+    fn feed(w: &mut RateWatchdog, t0: Instant, window: usize, kb: u64) -> Option<u64> {
+        w.on_bytes(kb * 1024, t0 + RATE_WINDOW * window as u32)
+    }
+
+    #[test]
+    fn watchdog_triggers_on_decay_after_fast_start() {
+        let mut w = RateWatchdog::new();
+        let t0 = Instant::now();
+        // 窗口1：~0.8MiB/s（突发带宽）→ 记录峰值，不触发。
+        assert_eq!(feed(&mut w, t0, 1, 8192), None);
+        // 窗口2：~25KiB/s，跌破峰值 1/4 → 触发重连。
+        assert!(feed(&mut w, t0, 2, 256).is_some());
+    }
+
+    #[test]
+    fn watchdog_ignores_slow_line_without_decay() {
+        let mut w = RateWatchdog::new();
+        let t0 = Instant::now();
+        // 两个窗口均 ~96KiB/s：无衰减（均速≈峰值），线路本身慢，不重连。
+        assert_eq!(feed(&mut w, t0, 1, 960), None);
+        assert_eq!(feed(&mut w, t0, 2, 960), None);
+    }
+
+    #[test]
+    fn watchdog_ignores_ramp_up() {
+        let mut w = RateWatchdog::new();
+        let t0 = Instant::now();
+        // TCP 慢启动逐步加速：每一窗口都在创新高，永不触发。
+        assert_eq!(feed(&mut w, t0, 1, 4096), None);
+        assert_eq!(feed(&mut w, t0, 2, 8192), None);
+        assert_eq!(feed(&mut w, t0, 3, 16384), None);
+    }
+
+    #[test]
+    fn watchdog_swallows_bytes_below_window_boundary() {
+        let mut w = RateWatchdog::new();
+        let t0 = Instant::now();
+        // 窗口未满时的字节只累计不判定。
+        assert_eq!(w.on_bytes(1024, t0 + Duration::from_secs(1)), None);
+        assert_eq!(w.window_bytes, 1024);
+    }
 
     #[test]
     fn part_paths() {

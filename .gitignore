@@ -6,3 +6,6 @@ Cargo.lock.bak
 node_modules/
 dist/
 .DS_Store
+.idea/
+dists.json
+probe_all.json

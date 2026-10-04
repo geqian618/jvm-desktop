@@ -26,6 +26,17 @@ pub struct FoojaySource {
     client: reqwest::Client,
 }
 
+/// foojay 偶发用 -1 表示"大小未知"（跨全部发行商/归档格式探测时必现，如
+/// zulu 的 JavaFX 包）；Option<u64> 遇负数会让整条 /packages 响应解析失败，
+/// 统一钳为 None。
+fn deserialize_size<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<i64>::deserialize(deserializer)?;
+    Ok(v.filter(|s| *s >= 0).map(|s| s as u64))
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 struct FjPackage {
@@ -43,6 +54,7 @@ struct FjPackage {
     javafx_bundled: bool,
     directly_downloadable: bool,
     filename: String,
+    #[serde(default, deserialize_with = "deserialize_size")]
     size: Option<u64>,
     links: FjLinks,
 }
@@ -202,6 +214,36 @@ impl FoojaySource {
         }
     }
 
+    /// /packages 查询参数。空 vendor 与空 archive_type 表示该维度不过滤
+    /// （平台可用发行商探测要跨全部发行商、任意归档格式查包）；foojay 对
+    /// 显式空值与缺省参数的处理不一致，缺省时直接不带参数。
+    fn package_query_params<'a>(
+        q: &'a PkgQuery,
+        version: Option<&'a str>,
+        latest: bool,
+    ) -> Vec<(&'a str, &'a str)> {
+        let mut params: Vec<(&str, &str)> = vec![
+            ("operating_system", &q.os),
+            ("architecture", &q.arch),
+            ("package_type", &q.image_type),
+            ("directly_downloadable", "true"),
+            ("release_status", "ga"),
+        ];
+        if !q.vendor.is_empty() {
+            params.push(("distribution", &q.vendor));
+        }
+        if !q.archive_type.is_empty() {
+            params.push(("archive_type", &q.archive_type));
+        }
+        if let Some(v) = version {
+            params.push(("version", v));
+        }
+        if latest {
+            params.push(("latest", "available"));
+        }
+        params
+    }
+
     /// 多候选时选优：优先非 JavaFX 捆绑的包。
     fn choose(packages: Vec<FjPackage>) -> Option<FjPackage> {
         let mut list = packages;
@@ -215,21 +257,7 @@ impl FoojaySource {
         version: Option<&str>,
         latest: bool,
     ) -> Result<Vec<FjPackage>> {
-        let mut params: Vec<(&str, &str)> = vec![
-            ("distribution", &q.vendor),
-            ("operating_system", &q.os),
-            ("architecture", &q.arch),
-            ("archive_type", &q.archive_type),
-            ("package_type", &q.image_type),
-            ("directly_downloadable", "true"),
-            ("release_status", "ga"),
-        ];
-        if let Some(v) = version {
-            params.push(("version", v));
-        }
-        if latest {
-            params.push(("latest", "available"));
-        }
+        let params = Self::package_query_params(q, version, latest);
         let resp = match self.request("/packages", &params).send().await {
             Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
                 let v = version.unwrap_or("(all)");
@@ -242,7 +270,29 @@ impl FoojaySource {
             Ok(r) => r,
             Err(e) => return Err(e.into()),
         };
-        let list: FjPackageList = resp.json().await?;
+        // 显式取文本再解析：纯 .json() 失败时只给前端一句
+        // "error decoding response body"，无法区分连接中断与 JSON 结构问题
+        let url = resp.url().clone();
+        let body = match resp.text().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(url = %url, err = ?e, "/packages 响应体读取失败");
+                return Err(e.into());
+            }
+        };
+        let list: FjPackageList = match serde_json::from_str(&body) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(
+                    url = %url,
+                    bytes = body.len(),
+                    head = %body.chars().take(300).collect::<String>(),
+                    err = %e,
+                    "/packages 响应 JSON 解析失败"
+                );
+                return Err(Error::msg(format!("/packages 响应 JSON 解析失败: {e}")));
+            }
+        };
         Ok(list.result)
     }
 
@@ -395,6 +445,25 @@ impl RegistrySource for FoojaySource {
         Ok(out)
     }
 
+    async fn platform_vendors(&self, os: &str, arch: &str) -> Result<Vec<String>> {
+        // 不带 distribution / archive_type 维度：该平台发过任意格式 GA JDK 包
+        // 即算"可用"。latest=available 只取各发行商最新版，把响应从 MB 级
+        // 压到几百 KB；发行商只要有过包，其最新版必然在结果里。
+        let q = PkgQuery {
+            vendor: String::new(),
+            feature: 0,
+            os: os.to_string(),
+            arch: arch.to_string(),
+            archive_type: String::new(),
+            image_type: "jdk".to_string(),
+        };
+        let packages = self.fetch_packages(&q, None, true).await?;
+        let mut out: Vec<String> = packages.into_iter().map(|p| p.distribution).collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
     async fn major_versions(&self) -> Result<Vec<MajorVersion>> {
         let list: FjMajorVersions = self.send_json("/major_versions", &[]).await?;
         let mut feats: Vec<MajorVersion> = list
@@ -484,6 +553,60 @@ mod tests {
         );
         assert!(release.package.info_uri.is_some());
         assert!(release.package.direct_url.is_some());
+    }
+
+    #[test]
+    fn package_params_skip_empty_vendor_and_archive() {
+        // 探测模式：vendor / archive_type 为空时不带对应参数，跨全部发行商查包
+        let probe = PkgQuery {
+            vendor: String::new(),
+            feature: 0,
+            os: "windows".into(),
+            arch: "x64".into(),
+            archive_type: String::new(),
+            image_type: "jdk".into(),
+        };
+        let keys: Vec<_> = FoojaySource::package_query_params(&probe, None, true)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(!keys.contains(&"distribution"));
+        assert!(!keys.contains(&"archive_type"));
+        assert!(keys.contains(&"latest"));
+
+        // 常规查询：distribution / archive_type 必须带上，latest 不带
+        let normal = PkgQuery {
+            vendor: "temurin".into(),
+            archive_type: "zip".into(),
+            ..probe
+        };
+        let params = FoojaySource::package_query_params(&normal, None, false);
+        assert!(params.contains(&("distribution", "temurin")));
+        assert!(params.contains(&("archive_type", "zip")));
+        assert!(!params.contains(&("latest", "available")));
+    }
+
+    #[test]
+    fn size_negative_clamps_to_none() {
+        // foojay 会返回 size:-1（如 zulu 的 JavaFX 包），不得让整条 /packages
+        // 响应解析失败——这是「平台可用发行商探测」上线后抓到的真实故障
+        let mk_body = |size: &str| {
+            format!(
+                r#"{{"result":[{{"id":"x","distribution":"zulu","major_version":27,
+                "java_version":"27+35","distribution_version":"27.28.103",
+                "release_status":"ga","term_of_support":"sts","operating_system":"windows",
+                "architecture":"x64","archive_type":"zip","package_type":"jdk",
+                "javafx_bundled":true,"directly_downloadable":true,
+                "filename":"zulu27.28.103-ca-fx-jdk27.0.0-win_x64.zip",
+                "links":{{"pkg_info_uri":"","pkg_download_redirect":""}},
+                "size":{size}}}]}}"#
+            )
+        };
+        let bad: FjPackageList = serde_json::from_str(&mk_body("-1")).unwrap();
+        assert_eq!(bad.result[0].size, None);
+
+        let ok: FjPackageList = serde_json::from_str(&mk_body("231762081")).unwrap();
+        assert_eq!(ok.result[0].size, Some(231762081));
     }
 
     #[test]

@@ -189,7 +189,11 @@ pub async fn download_with_plan(
             expected_sha256: plan.expected_sha256,
             checksum_url: plan.checksum_url,
             expected_size: plan.size,
-            concurrency: 8,
+            // 并发 4：实测部分下载源（如 download.java.net）按"每 IP 总量"
+            // 限速——16 连接并发实测总速度与单连接几乎相同（~300KB/s），
+            // 只会把额度切成细条、把每条压到看门狗阈值之下诱发重连。
+            // 4 连接在"每连接限速"与"每 IP 限速"两类路径上都是安全档。
+            concurrency: 4,
             cancel,
         },
         progress,
@@ -222,7 +226,7 @@ pub async fn download_only(
 }
 
 /// 安装已下载的归档：解压 → 验证 → 写索引。`dir_name` 允许 GUI 自定义
-/// 目录名（如 `{distribution}-{javaVersion}`），缺省用消毒后的 vendor_version。
+/// 目录名（如 `{distribution}@{javaVersion}`），缺省用 [`JdkId::to_dir_name`]。
 pub fn install_downloaded(
     home: &Home,
     release: &Release,

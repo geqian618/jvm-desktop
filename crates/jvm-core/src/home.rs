@@ -158,7 +158,7 @@ mod tests {
         let id = JdkId::parse("temurin@17.0.12+7").unwrap();
         assert_eq!(
             home.version_dir(&id),
-            PathBuf::from("/tmp/jvm-test/versions/temurin_17.0.12_7")
+            PathBuf::from("/tmp/jvm-test/versions/temurin@17.0.12+7")
         );
     }
 
