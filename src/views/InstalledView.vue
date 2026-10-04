@@ -92,8 +92,8 @@ onMounted(() => store.refreshLocal());
       <thead>
         <tr>
           <th class="w-name">{{ t("installed.colName") }}</th>
-          <th>{{ t("installed.colVersion") }}</th>
           <th>{{ t("installed.colVendor") }}</th>
+          <th>{{ t("installed.colVersion") }}</th>
           <th>{{ t("installed.colPath") }}</th>
           <th>{{ t("installed.colInstallDate") }}</th>
           <th>{{ t("installed.colStatus") }}</th>
@@ -105,12 +105,12 @@ onMounted(() => store.refreshLocal());
           <td class="w-name">
             <span class="name">{{ displayName(jdk) }}</span>
           </td>
+          <td class="muted w-vendor">{{ jdk.vendor || t("installed.unknown") }}</td>
           <td>
             <span class="mono">{{
               jdk.javaVersion || t("installed.unknown")
             }}</span>
           </td>
-          <td class="muted w-vendor">{{ jdk.vendor || t("installed.unknown") }}</td>
           <td class="mono path w-path" :title="jdk.dir">{{ jdk.dir }}</td>
           <td class="mono muted w-date">{{ jdk.installedAt || "-" }}</td>
           <td>

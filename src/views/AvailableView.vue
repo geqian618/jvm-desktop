@@ -175,8 +175,8 @@ function vendorName(r: ReleaseInfo): string {
         <tr>
           <th>{{ t("available.colName") }}</th>
           <th>{{ t("available.colVendor") }}</th>
-          <th>{{ t("available.colVersion") }}</th>
           <th>{{ t("available.colDistVersion") }}</th>
+          <th>{{ t("available.colVersion") }}</th>
           <th>{{ t("available.colType") }}</th>
           <th>{{ t("available.colSize") }}</th>
           <th>{{ t("available.colAction") }}</th>
@@ -190,8 +190,8 @@ function vendorName(r: ReleaseInfo): string {
           <td class="dist-cell">
             <span :title="vendorName(r)">{{ vendorName(r) }}</span>
           </td>
-          <td class="mono">{{ r.javaVersion }}</td>
           <td class="muted">{{ r.distributionVersion || "-" }}</td>
+          <td class="mono">{{ r.javaVersion }}</td>
           <td>
             <span v-if="isLts(parseInt(r.javaVersion, 10))" class="pill pill-ok">LTS</span>
             <span v-else class="muted">{{ supportLabel(r.termOfSupport) }}</span>
