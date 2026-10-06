@@ -135,6 +135,17 @@ const sourceEditor = ref<{ index: number; name: string; url: string } | null>(
   null,
 );
 const sourceError = ref("");
+// 保存成功的轻提示：不收起编辑器，由 toast 告知结果
+const savedTipVisible = ref(false);
+let savedTipTimer: ReturnType<typeof setTimeout> | undefined;
+
+function showSavedTip() {
+  savedTipVisible.value = true;
+  if (savedTipTimer) clearTimeout(savedTipTimer);
+  savedTipTimer = setTimeout(() => {
+    savedTipVisible.value = false;
+  }, 2500);
+}
 
 function openAddSource() {
   sourceError.value = "";
@@ -157,11 +168,34 @@ function cancelSourceEditor() {
   sourceError.value = "";
 }
 
+// 内置预设的出厂定义（与后端 jvm-core store::builtin_presets 保持一致）：
+// 编辑内置预设时字段留空回退到这里的值，而不是报错。
+const BUILTIN_PRESET_DEFAULTS = [
+  { name: "Foojay Disco (Official)", url: "https://api.foojay.io/disco/v3.0" },
+  { name: "Adoptium (Temurin)", url: "https://api.adoptium.net/v3" },
+];
+
 function saveSourceEditor() {
   const ed = sourceEditor.value;
   if (!ed) return;
-  const name = ed.name.trim();
-  const url = ed.url.trim().replace(/\/+$/, "");
+  let name = ed.name.trim();
+  let url = ed.url.trim().replace(/\/+$/, "");
+  if ((!name || !url) && ed.index >= 0) {
+    // 内置预设留空 → 按当前名称或 URL 认出对应出厂定义并回退；
+    // 自定义预设与身份不明的内置预设仍提示必填。
+    const cur = cfg.value.registryPresets[ed.index];
+    const factory = cur?.builtIn
+      ? BUILTIN_PRESET_DEFAULTS.find(
+          (b) =>
+            b.name.toLowerCase() === cur.name.trim().toLowerCase() ||
+            b.url.replace(/\/+$/, "") === cur.url.replace(/\/+$/, ""),
+        )
+      : undefined;
+    if (factory) {
+      if (!name) name = factory.name;
+      if (!url) url = factory.url;
+    }
+  }
   if (!name || !url) {
     sourceError.value = t("settings.sourceNeeded");
     return;
@@ -179,6 +213,8 @@ function saveSourceEditor() {
   if (ed.index < 0) {
     cfg.value.registryPresets.push({ name, url });
     cfg.value.registry = url;
+    // 编辑器保持展开并绑定到新建条目：再次保存不会触发 URL 重复校验
+    sourceEditor.value = { index: cfg.value.registryPresets.length - 1, name, url };
   } else {
     const p = cfg.value.registryPresets[ed.index];
     const wasSelected = cfg.value.registry === p.url;
@@ -186,7 +222,9 @@ function saveSourceEditor() {
     p.url = url;
     if (wasSelected) cfg.value.registry = url;
   }
-  cancelSourceEditor();
+  // 不收起编辑器；自动落盘由 store 的深度 watcher 防抖完成
+  sourceError.value = "";
+  showSavedTip();
 }
 
 async function removeSource(index: number) {
@@ -209,6 +247,28 @@ async function removeSource(index: number) {
 
 <template>
   <div class="settings view">
+    <Transition name="toast-fade">
+      <div v-if="savedTipVisible" class="saved-toast">
+        <svg
+          class="toast-icon"
+          viewBox="0 0 24 24"
+          width="16"
+          height="16"
+          aria-hidden="true"
+        >
+          <circle cx="12" cy="12" r="10" fill="#67c23a" />
+          <path
+            d="M7.5 12.5l3 3 6-6.5"
+            stroke="#fff"
+            stroke-width="2"
+            fill="none"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+        <span>{{ t("settings.saved") }}</span>
+      </div>
+    </Transition>
     <div class="page-head">
       <h2>{{ t("settings.title") }}</h2>
       <div class="spacer" />
@@ -874,5 +934,40 @@ h2 {
   font-size: 12px;
   color: var(--text2);
   line-height: 1.8;
+}
+
+/* 数据源保存成功的轻提示：对齐 Element Plus ElMessage 实测样式，
+   顶部居中 2.5s 自动淡出 */
+.saved-toast {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 15px;
+  border-radius: 4px;
+  background: #f0f9eb;
+  border: 1px solid #e1f3d8;
+  color: #67c23a;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.toast-icon {
+  flex: 0 0 auto;
+}
+
+.toast-fade-enter-active,
+.toast-fade-leave-active {
+  transition: opacity 0.25s, transform 0.25s;
+}
+
+.toast-fade-enter-from,
+.toast-fade-leave-to {
+  opacity: 0;
+  transform: translateX(-50%) translateY(-8px);
 }
 </style>

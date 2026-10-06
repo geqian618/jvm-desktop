@@ -101,6 +101,24 @@ pub struct Settings {
     pub unbind_deletes_jvmrc: bool,
 }
 
+/// 内置数据源预设的出厂定义：`Settings::default()` 由此生成；编辑内置
+/// 预设时名称/URL 留空也按此回退。GUI 侧在 SettingsView.vue 有一份镜像
+/// 定义（BUILTIN_PRESET_DEFAULTS），改动需两处同步。
+pub fn builtin_presets() -> [RegistryPreset; 2] {
+    [
+        RegistryPreset {
+            name: "Foojay Disco (Official)".to_string(),
+            url: crate::source::FOOJAY_BASE.to_string(),
+            built_in: true,
+        },
+        RegistryPreset {
+            name: "Adoptium (Temurin)".to_string(),
+            url: crate::source::ADOPTIUM_BASE.to_string(),
+            built_in: true,
+        },
+    ]
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -109,18 +127,7 @@ impl Default for Settings {
             install_dir: String::new(),
             download_dir: String::new(),
             registry: String::new(),
-            registry_presets: vec![
-                RegistryPreset {
-                    name: "Foojay Disco (Official)".to_string(),
-                    url: crate::source::FOOJAY_BASE.to_string(),
-                    built_in: true,
-                },
-                RegistryPreset {
-                    name: "Adoptium (Temurin)".to_string(),
-                    url: crate::source::ADOPTIUM_BASE.to_string(),
-                    built_in: true,
-                },
-            ],
+            registry_presets: builtin_presets().to_vec(),
             proxy: String::new(),
             source_api_key: String::new(),
             auto_clean_download: false,

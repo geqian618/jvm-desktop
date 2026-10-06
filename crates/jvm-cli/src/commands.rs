@@ -922,9 +922,18 @@ fn preset_matches(p: &RegistryPreset, t: &str) -> bool {
     n == t || n.eq_ignore_ascii_case(t)
 }
 
+/// 内置预设对应的出厂定义：按当前名称（忽略大小写）或 URL 匹配；
+/// 两者都已改过时返回 None（此时留空无法确定回退目标，保持报错）。
+fn builtin_default_for(p: &RegistryPreset) -> Option<RegistryPreset> {
+    store::builtin_presets().into_iter().find(|b| {
+        b.name.eq_ignore_ascii_case(p.name.trim())
+            || b.url.trim_end_matches('/') == p.url.trim().trim_end_matches('/')
+    })
+}
+
 /// 编辑预设的名称或 URL（对齐 GUI「编辑数据源」：内置预设也可编辑）。
-/// URL 变更时校验可达性（--force 跳过）；被编辑的是当前源时，
-/// 当前源跟着指向新 URL。
+/// 内置预设字段留空回退出厂默认；URL 变更时校验可达性（--force 跳过）；
+/// 被编辑的是当前源时，当前源跟着指向新 URL。
 async fn registry_edit(
     settings: &mut Settings,
     home: &Home,
@@ -950,8 +959,26 @@ async fn registry_edit(
     let new_url = new_url
         .map(|u| u.trim().trim_end_matches('/').to_string())
         .unwrap_or_else(|| old_url.clone());
+    let mut new_name = new_name;
+    let mut new_url = new_url;
     if new_name.is_empty() || new_url.is_empty() {
-        return Err(jvm_core::Error::msg("名称与 URL 不能为空"));
+        // 内置预设字段留空 → 回退出厂默认；自定义预设与身份不明
+        // （名称和 URL 都已改过）的内置预设仍视为非法输入。
+        match settings.registry_presets[idx]
+            .built_in
+            .then(|| builtin_default_for(&settings.registry_presets[idx]))
+            .flatten()
+        {
+            Some(f) => {
+                if new_name.is_empty() {
+                    new_name = f.name;
+                }
+                if new_url.is_empty() {
+                    new_url = f.url;
+                }
+            }
+            None => return Err(jvm_core::Error::msg("名称与 URL 不能为空")),
+        }
     }
     if !new_url.starts_with("http://") && !new_url.starts_with("https://") {
         return Err(jvm_core::Error::msg(format!(
