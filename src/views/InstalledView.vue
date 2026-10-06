@@ -10,10 +10,10 @@ const { t } = useI18n();
 const store = useAppStore();
 const dialog = useDialogStore();
 
-// 与项目关联页保持一致：内部已登记的 JDK 显示规范 id（vendor@version，
-// 即 .jvmrc 内容），外部导入（id 为 external@哈希）或未登记的目录显示名称
+// 与项目关联页保持一致：已登记的 JDK 显示规范 id（vendor@version，
+// 即 .jvmrc 内容），未登记的目录显示名称
 function displayName(jdk: LocalJdk): string {
-  return jdk.id && !jdk.id.startsWith("external@") ? jdk.id : jdk.name;
+  return jdk.id || jdk.name;
 }
 
 async function removeJdk(jdk: LocalJdk) {
@@ -43,9 +43,7 @@ async function removeJdk(jdk: LocalJdk) {
 
   const ok = await dialog.confirm({
     title: t("installed.uninstall"),
-    message: jdk.inInstallDir
-      ? t("installed.confirmUninstall")
-      : t("installed.confirmUninstallExternal"),
+    message: t("installed.confirmUninstall"),
     kind: "warning",
     danger: true,
     confirmText: t("installed.uninstall"),
@@ -57,6 +55,26 @@ async function removeJdk(jdk: LocalJdk) {
     // 删除失败（文件被占用等）弹窗可见，不再只写日志
     await dialog.alert({
       title: t("installed.uninstall"),
+      message: String(e),
+      kind: "error",
+    });
+  }
+}
+
+async function unsetDefault(jdk: LocalJdk) {
+  const ok = await dialog.confirm({
+    title: t("installed.unset"),
+    message: t("installed.confirmUnset", { name: displayName(jdk) }),
+    kind: "warning",
+    danger: true,
+    confirmText: t("installed.unset"),
+  });
+  if (!ok) return;
+  try {
+    await store.unsetDefault();
+  } catch (e) {
+    await dialog.alert({
+      title: t("installed.unset"),
       message: String(e),
       kind: "error",
     });
@@ -150,6 +168,13 @@ onMounted(() => store.refreshLocal());
               @click="store.useJdk(jdk.dir)"
             >
               {{ t("installed.use") }}
+            </button>
+            <button
+              v-else
+              class="btn-ghost btn-sm"
+              @click="unsetDefault(jdk)"
+            >
+              {{ t("installed.unset") }}
             </button>
             <button class="btn-ghost btn-sm" @click="api.openDir(jdk.dir)">
               {{ t("installed.open") }}

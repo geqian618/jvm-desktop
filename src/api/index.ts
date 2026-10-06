@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AppConfig,
   DistributionInfo,
+  HealthIssue,
   LocalJdk,
   MajorVersion,
   PathDefaults,
@@ -15,6 +16,8 @@ export const api = {
   saveConfig: (config: AppConfig) => invoke<void>("save_config", { config }),
   getPlatform: () => invoke<Platform>("get_platform"),
   getDefaultPaths: () => invoke<PathDefaults>("get_default_paths"),
+  healthCheck: () => invoke<HealthIssue[]>("health_check"),
+  healthRepair: () => invoke<string[]>("health_repair"),
   getDistributions: () => invoke<DistributionInfo[]>("get_distributions"),
   getMajorVersions: () => invoke<MajorVersion[]>("get_major_versions"),
   getAvailableVendors: (operatingSystem: string, architecture: string) =>
@@ -42,6 +45,7 @@ export const api = {
     invoke<string[]>("get_downloaded_ids", { releases }),
   cancelTask: (taskId: string) => invoke<void>("cancel_task", { taskId }),
   useJdk: (dir: string) => invoke<void>("use_jdk", { dir }),
+  unsetDefault: () => invoke<void>("unset_default"),
   uninstallJdk: (dir: string) => invoke<void>("uninstall_jdk", { dir }),
   openDir: (path: string) => invoke<void>("open_dir", { path }),
   listProjects: () => invoke<ProjectEntry[]>("list_projects"),

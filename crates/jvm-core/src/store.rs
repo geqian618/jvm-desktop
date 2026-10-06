@@ -25,9 +25,7 @@ pub fn load_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    serde_json::from_str(&text)
-        .map(Some)
-        .map_err(Error::from)
+    serde_json::from_str(&text).map(Some).map_err(Error::from)
 }
 
 /// 带损坏兜底的加载：文件缺失或 JSON 损坏时回退为默认值并告警，
@@ -98,6 +96,9 @@ pub struct Settings {
     pub source_api_key: String,
     /// 安装成功后自动删除下载目录里的压缩包（GUI 设置项）
     pub auto_clean_download: bool,
+    /// 解除项目关联时同时删除项目目录里的 .jvmrc（GUI 设置项；
+    /// 该文件可能已提交到 Git 供团队共享，默认保留）
+    pub unbind_deletes_jvmrc: bool,
 }
 
 impl Default for Settings {
@@ -123,6 +124,7 @@ impl Default for Settings {
             proxy: String::new(),
             source_api_key: String::new(),
             auto_clean_download: false,
+            unbind_deletes_jvmrc: false,
         }
     }
 }
@@ -156,20 +158,15 @@ pub struct InstalledJdk {
     pub version: String,
     pub feature: u32,
     pub lts: bool,
-    /// 内部安装为 `versions/` 下的目录名；外部登记为绝对路径。
+    /// `versions/` 下的目录名。
     pub dir: String,
     /// 安装验证时 `java -version` 的输出，供 GUI/doctor 展示。
     pub java_version_output: String,
-    pub imported: bool,
-    /// 外部 JDK（本地扫描登记）：卸载只解除登记，不删除文件。
-    pub external: bool,
     pub installed_at: String,
 }
 
 impl InstalledJdk {
-    /// 记录的唯一标识。`id` 字段是权威：内部安装为 `vendor@version`，
-    /// 外部 JDK 为 `external@<目录名>-<路径哈希>`（vendor/version 是探测出的
-    /// 展示值，可能与 id 不同，不能用它反推标识）。
+    /// 记录的唯一标识（`vendor@version`）。
     pub fn jdk_id(&self) -> JdkId {
         JdkId::parse(&self.id)
             .unwrap_or_else(|_| JdkId::new(self.vendor.clone(), self.version.clone()))
@@ -212,15 +209,9 @@ impl Index {
     }
 }
 
-/// 把索引记录的 dir 字段解析为实际路径：绝对路径原样（外部 JDK），
-/// 相对路径基于 `versions/` 解析。
+/// 把索引记录的 dir 字段解析为实际路径：`versions/` 下的目录名。
 pub fn resolve_dir(home: &Home, dir: &str) -> PathBuf {
-    let p = Path::new(dir);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        home.versions().join(p)
-    }
+    home.versions().join(dir)
 }
 
 pub fn load_index(home: &Home) -> Result<Index> {
@@ -365,6 +356,15 @@ pub fn write_default(home: &Home, id: &JdkId) -> Result<()> {
     write_text_atomic(&home.default_file(), &format!("{id}\n"))
 }
 
+/// 移除 default 登记（取消默认用）；文件不存在视为已移除。
+pub fn remove_default(home: &Home) -> Result<()> {
+    match std::fs::remove_file(home.default_file()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::msg(format!("删除 default 文件失败: {e}"))),
+    }
+}
+
 // ---------- 路径归一化 ----------
 
 /// 生成用于比较的路径键：绝对化、`/` 分隔、去 `\\?\` 前缀、Windows 下小写。
@@ -414,8 +414,6 @@ mod tests {
             lts: true,
             dir: "temurin_17.0.12_7".into(),
             java_version_output: "openjdk version \"17.0.12\"".into(),
-            imported: false,
-            external: false,
             installed_at: "2026-10-01T00:00:00Z".into(),
         });
         save_index(&home, &index).unwrap();
@@ -570,8 +568,6 @@ mod tests {
             lts,
             dir: String::new(),
             java_version_output: String::new(),
-            imported: false,
-            external: false,
             installed_at: String::new(),
         };
         index.upsert(mk(false));
@@ -591,8 +587,7 @@ mod tests {
         assert_eq!(date.matches('-').count(), 2, "YYYY-MM-DD: {date}");
         // UTC 20:30 在东八区已是次日，说明确实做了时区转换
         let utc_date = "2026-10-01";
-        let shifted = date != utc_date
-            || chrono::Local::now().format("%z").to_string() == "+0000";
+        let shifted = date != utc_date || chrono::Local::now().format("%z").to_string() == "+0000";
         assert!(
             shifted,
             "非零时区下 UTC 20:30 的本地日期应不同于 UTC 日期: {date}"
@@ -600,37 +595,16 @@ mod tests {
 
         // 空/非法值 → None（旧索引、测试桩）
         assert!(InstalledJdk::default().installed_date().is_none());
-        assert!(
-            InstalledJdk {
-                installed_at: "t".into(),
-                ..Default::default()
-            }
-            .installed_date()
-            .is_none()
-        );
+        assert!(InstalledJdk {
+            installed_at: "t".into(),
+            ..Default::default()
+        }
+        .installed_date()
+        .is_none());
     }
 
     #[test]
     fn jdk_id_uses_authoritative_id_field() {
-        // 外部 JDK：id 是 external@哈希，vendor/version 是探测展示值，
-        // 回归测试：此前用 vendor@version 反推标识，导致重复启用/卸载时
-        // 按 id 查索引报 NotFound。
-        let external = InstalledJdk {
-            id: "external@my-jdk-1234abcd".into(),
-            name: "my-jdk".into(),
-            vendor: "Test Vendor".into(),
-            version: "21.0.1".into(),
-            feature: 21,
-            lts: false,
-            dir: String::new(),
-            java_version_output: String::new(),
-            imported: true,
-            external: true,
-            installed_at: String::new(),
-        };
-        assert_eq!(external.jdk_id().to_string(), "external@my-jdk-1234abcd");
-
-        // 内部记录：id 与 vendor@version 一致
         let internal = InstalledJdk {
             id: "temurin@17.0.12+7".into(),
             name: String::new(),
@@ -640,8 +614,6 @@ mod tests {
             lts: true,
             dir: String::new(),
             java_version_output: String::new(),
-            imported: false,
-            external: false,
             installed_at: String::new(),
         };
         assert_eq!(internal.jdk_id().to_string(), "temurin@17.0.12+7");

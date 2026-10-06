@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use super::{DistributionInfo, MajorVersion, PackageDetail, PkgQuery, RegistrySource};
 use crate::error::{Error, Result};
-use crate::model::{Release, RemotePackage, version_feature};
+use crate::model::{version_feature, Release, RemotePackage};
 
 #[derive(Debug, Clone)]
 pub struct FoojaySource {
@@ -377,17 +377,11 @@ impl RegistrySource for FoojaySource {
 
     async fn latest_for_feature(&self, query: &PkgQuery) -> Result<Option<Release>> {
         let version = query.feature.to_string();
-        let packages = self
-            .fetch_packages(query, Some(&version), true)
-            .await?;
+        let packages = self.fetch_packages(query, Some(&version), true).await?;
         Ok(Self::choose(packages).as_ref().and_then(Self::to_release))
     }
 
-    async fn package_for_exact(
-        &self,
-        query: &PkgQuery,
-        version: &str,
-    ) -> Result<Option<Release>> {
+    async fn package_for_exact(&self, query: &PkgQuery, version: &str) -> Result<Option<Release>> {
         let packages = self.fetch_packages(query, Some(version), false).await?;
         let Some(fj) = Self::choose(packages) else {
             return Ok(None);

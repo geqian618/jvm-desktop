@@ -61,15 +61,7 @@ impl Home {
     pub fn detect() -> Self {
         let root = match std::env::var_os("JVM_HOME").filter(|v| !v.is_empty()) {
             Some(v) => PathBuf::from(v),
-            // 旧版自定义位置：尊重用户既有配置，不做迁移
-            None => match std::env::var_os("JDM_HOME").filter(|v| !v.is_empty()) {
-                Some(v) => PathBuf::from(v),
-                None => {
-                    let default_root = user_home().join(".jvm");
-                    crate::migrate::migrate_legacy_default_root(&default_root);
-                    default_root
-                }
-            },
+            None => user_home().join(".jvm"),
         };
         Self {
             root,

@@ -1,6 +1,6 @@
 [package]
 name = "jvm-cli"
-description = "jdm 命令行：JDK 版本管理（ls/install/use/…）与 shim 自分发入口"
+description = "jvm 命令行：JDK 版本管理（ls/install/use/…）与 shim 自分发入口"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

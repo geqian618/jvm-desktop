@@ -13,7 +13,7 @@ use crate::home::Home;
 use crate::installer;
 use crate::model::{archive_filename, cmp_versions, version_feature, JdkId, Release, VersionRef};
 use crate::source::{from_settings, PkgQuery};
-use crate::store::{self, InstalledJdk, Index, ProjectEntry, Settings};
+use crate::store::{self, Index, InstalledJdk, ProjectEntry, Settings};
 use crate::switcher;
 
 /// 拆分用户输入：`temurin@17.0.12+7` → (temurin, Exact)；`17` → (None, Feature)。
@@ -107,45 +107,44 @@ pub async fn plan_download_for_release(
     settings: &Settings,
     release: &Release,
 ) -> Result<DownloadPlan> {
-    let detail = if release.package.checksum_sha256.is_some()
-        && release.package.direct_url.is_some()
-    {
-        release.clone()
-    } else if let Some(uri) = release
-        .package
-        .info_uri
-        .as_deref()
-        .map(str::trim)
-        .filter(|u| !u.is_empty())
-    {
-        // 首选：按包 id 详情直查（foojay /ids/{id}）。GUI 传入的 Release
-        // 带着列表响应里的 info_uri，按 id 补全不依赖版本串匹配——部分包
-        // （graalvm/dragonwell 等）用 version= 过滤是命中不到的。
-        let source = from_settings(settings)?;
-        let det = source.package_detail_by_uri(uri).await?;
-        let mut pkg = release.package.clone();
-        if det.direct_url.is_some() {
-            pkg.direct_url = det.direct_url;
-        }
-        if det.checksum_sha256.is_some() {
-            pkg.checksum_sha256 = det.checksum_sha256;
-        }
-        if det.checksum_url.is_some() {
-            pkg.checksum_url = det.checksum_url;
-        }
-        Release {
-            package: pkg,
-            ..release.clone()
-        }
-    } else {
-        // 兜底：版本串精确匹配（CLI 或列表未带 info_uri 的源）。
-        let source = from_settings(settings)?;
-        let query = PkgQuery::for_local_machine(&release.vendor, release.feature);
-        source
-            .package_for_exact(&query, &release.version)
-            .await?
-            .ok_or_else(|| Error::NotFound(release.version.clone()))?
-    };
+    let detail =
+        if release.package.checksum_sha256.is_some() && release.package.direct_url.is_some() {
+            release.clone()
+        } else if let Some(uri) = release
+            .package
+            .info_uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
+            // 首选：按包 id 详情直查（foojay /ids/{id}）。GUI 传入的 Release
+            // 带着列表响应里的 info_uri，按 id 补全不依赖版本串匹配——部分包
+            // （graalvm/dragonwell 等）用 version= 过滤是命中不到的。
+            let source = from_settings(settings)?;
+            let det = source.package_detail_by_uri(uri).await?;
+            let mut pkg = release.package.clone();
+            if det.direct_url.is_some() {
+                pkg.direct_url = det.direct_url;
+            }
+            if det.checksum_sha256.is_some() {
+                pkg.checksum_sha256 = det.checksum_sha256;
+            }
+            if det.checksum_url.is_some() {
+                pkg.checksum_url = det.checksum_url;
+            }
+            Release {
+                package: pkg,
+                ..release.clone()
+            }
+        } else {
+            // 兜底：版本串精确匹配（CLI 或列表未带 info_uri 的源）。
+            let source = from_settings(settings)?;
+            let query = PkgQuery::for_local_machine(&release.vendor, release.feature);
+            source
+                .package_for_exact(&query, &release.version)
+                .await?
+                .ok_or_else(|| Error::NotFound(release.version.clone()))?
+        };
 
     let url = detail
         .package
@@ -244,9 +243,7 @@ pub fn install_downloaded(
     let dir = match dir_name {
         Some(name) => {
             let name = name.trim();
-            if name.is_empty()
-                || name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|'])
-            {
+            if name.is_empty() || name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|']) {
                 return Err(Error::msg(format!("非法的安装目录名: {name}")));
             }
             name.to_string()
@@ -277,8 +274,6 @@ pub fn install_downloaded(
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default(),
         java_version_output: outcome.java_version_output,
-        imported: false,
-        external: false,
         installed_at: chrono::Utc::now().to_rfc3339(),
     };
     // 锁内重读最新索引再登记：安装（下载+解压）耗时期间其他并发任务
@@ -319,15 +314,11 @@ pub async fn install_release_with_plan(
         )));
     }
 
-    let downloaded =
-        download_with_plan(home, settings, release, plan, progress, None).await?;
+    let downloaded = download_with_plan(home, settings, release, plan, progress, None).await?;
     install_downloaded(home, release, &downloaded, None)
 }
 
-/// 启用某个目录的 JDK（已装内部版本或扫描到的外部 JDK）。
-///
-/// 外部 JDK 首次启用时登记进索引（external 标记，dir 为绝对路径），
-/// 之后 default / current 联接 / shim 全部按既有机制工作。
+/// 启用某个已安装（索引已登记）的 JDK 目录。
 pub fn use_dir(home: &Home, dir: &Path) -> Result<JdkId> {
     let mut env_writer = crate::env::platform_writer(&home.logs());
     use_dir_with(home, dir, env_writer.as_mut())
@@ -339,9 +330,7 @@ pub fn use_dir_with(
     dir: &Path,
     env: &mut dyn crate::env::UserEnvWriter,
 ) -> Result<JdkId> {
-    let dir = dir
-        .canonicalize()
-        .unwrap_or_else(|_| dir.to_path_buf());
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     if installer::jdk_home_of(&dir).is_none() {
         return Err(Error::msg(format!(
             "{} 不是有效的 JDK 主目录（缺 bin/java）",
@@ -350,60 +339,27 @@ pub fn use_dir_with(
     }
 
     let index = store::load_index(home)?;
-    let id = match index
+    let id = index
         .installed
         .iter()
-        .find(|r| crate::store::path_key(&store::resolve_dir(home, &r.dir)) == crate::store::path_key(&dir))
-    {
-        Some(rec) => rec.jdk_id(),
-        None => external_id(&dir),
-    };
-
-    if matches!(split_id(&id.to_string()).0, Some("external")) {
-        store::update_index(home, |index| {
-            if index.get(&id.to_string()).is_none() {
-                let name = dir
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| dir.to_string_lossy().into_owned());
-                let probe = crate::scan::probe_dir(&dir).unwrap_or_default();
-                let version = probe.java_version.unwrap_or_default();
-                index.upsert(InstalledJdk {
-                    id: id.to_string(),
-                    name,
-                    vendor: probe.vendor.unwrap_or_else(|| "外部".to_string()),
-                    version: version.clone(),
-                    feature: version_feature(&version).unwrap_or(0),
-                    lts: false,
-                    dir: dir.to_string_lossy().into_owned(),
-                    java_version_output: String::new(),
-                    imported: true,
-                    external: true,
-                    installed_at: chrono::Utc::now().to_rfc3339(),
-                });
-            }
-            Ok(())
+        .find(|r| {
+            crate::store::path_key(&store::resolve_dir(home, &r.dir))
+                == crate::store::path_key(&dir)
+        })
+        .map(|rec| rec.jdk_id())
+        .ok_or_else(|| {
+            Error::msg(format!(
+                "{} 不是本工具安装的 JDK（未登记索引）",
+                dir.display()
+            ))
         })?;
-    }
 
     switch_default_with(home, &id, env)?;
     tracing::info!(id = %id, dir = %dir.display(), "已启用 JDK（default/current 链接/shim 已更新）");
     Ok(id)
 }
 
-/// 外部 JDK 的稳定标识：external@<目录名>-<路径哈希>（防同名冲突）。
-fn external_id(dir: &Path) -> JdkId {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    crate::store::path_key(dir).hash(&mut h);
-    let name = dir
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "jdk".to_string());
-    JdkId::new("external", format!("{name}-{:08x}", h.finish() as u32))
-}
-
-/// 卸载：守卫（默认/被绑定拒绝）→ 删目录（外部 JDK 只解除登记）→ 删索引。
+/// 卸载：守卫（默认/被绑定拒绝）→ 删目录 → 删索引。
 pub fn uninstall(home: &Home, id: &JdkId) -> Result<()> {
     switcher::ensure_uninstallable(home, id)?;
     let index = store::load_index(home)?;
@@ -411,12 +367,10 @@ pub fn uninstall(home: &Home, id: &JdkId) -> Result<()> {
         .get(&id.to_string())
         .ok_or_else(|| Error::NotFound(id.to_string()))?
         .clone();
-    tracing::info!(id = %id, dir = %rec.dir, external = rec.external, "开始卸载 JDK");
-    if !rec.external {
-        let dir = store::resolve_dir(home, &rec.dir);
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir)?;
-        }
+    tracing::info!(id = %id, dir = %rec.dir, "开始卸载 JDK");
+    let dir = store::resolve_dir(home, &rec.dir);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
     }
     // 锁内重读-移除-写回，避免与并发安装/登记互相覆盖
     store::update_index(home, |index| {
@@ -463,11 +417,20 @@ pub fn bind_project(home: &Home, dir: &Path, id: &JdkId) -> Result<bool> {
     Ok(is_new)
 }
 
+/// 取消默认版本（GUI/CLI 共用）：摘 current 链接、删 shim、清理环境变量。
+pub fn unset_default(home: &Home) -> Result<bool> {
+    let mut env_writer = crate::env::platform_writer(&home.logs());
+    unset_default_with(home, env_writer.as_mut())
+}
+
+/// [`unset_default`] 的可注入变体：测试传 `NoopEnvWriter`。
+pub fn unset_default_with(home: &Home, env: &mut dyn crate::env::UserEnvWriter) -> Result<bool> {
+    switcher::unset_default(home, env)
+}
+
 /// 解除项目目录绑定（保留磁盘上的 .jvmrc 删除与否交由调用方）。
 pub fn unbind_project(home: &Home, dir: &Path) -> Result<bool> {
-    let removed = store::update_projects(home, |projects| {
-        Ok(projects.remove_by_path(dir))
-    })?;
+    let removed = store::update_projects(home, |projects| Ok(projects.remove_by_path(dir)))?;
     tracing::info!(dir = %dir.display(), removed, "项目关联解除请求处理完毕");
     Ok(removed)
 }
@@ -505,8 +468,6 @@ mod tests {
             lts: true,
             dir: dir.to_string(),
             java_version_output: String::new(),
-            imported: false,
-            external: false,
             installed_at: "t".into(),
         }
     }
@@ -533,8 +494,20 @@ mod tests {
     #[test]
     fn match_installed_picks_newest_and_respects_vendor() {
         let mut index = Index::default();
-        index.upsert(rec_with("temurin@17.0.12+7", "temurin", "17.0.12+7", 17, "a"));
-        index.upsert(rec_with("temurin@17.0.20.1+1", "temurin", "17.0.20.1+1", 17, "b"));
+        index.upsert(rec_with(
+            "temurin@17.0.12+7",
+            "temurin",
+            "17.0.12+7",
+            17,
+            "a",
+        ));
+        index.upsert(rec_with(
+            "temurin@17.0.20.1+1",
+            "temurin",
+            "17.0.20.1+1",
+            17,
+            "b",
+        ));
         index.upsert(rec_with("zulu@17.0.12+7", "zulu", "17.0.12+7", 17, "c"));
         index.upsert(rec_with("zulu@21.0.1+12", "zulu", "21.0.1+12", 21, "d"));
 
@@ -649,7 +622,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("marker"), b"x").unwrap();
         let mut index = store::load_index(&home).unwrap();
-        index.upsert(rec_with(&id.to_string(), "temurin", "17.0.12+7", 17, &id.to_dir_name()));
+        index.upsert(rec_with(
+            &id.to_string(),
+            "temurin",
+            "17.0.12+7",
+            17,
+            &id.to_dir_name(),
+        ));
         store::save_index(&home, &index).unwrap();
 
         // 默认版本受保护
@@ -659,28 +638,10 @@ mod tests {
 
         uninstall(&home, &id).unwrap();
         assert!(!dir.exists(), "内部版本目录应被删除");
-        assert!(store::load_index(&home).unwrap().get(&id.to_string()).is_none());
-    }
-
-    #[test]
-    fn uninstall_keeps_external_dir_but_unregisters() {
-        let (_d, home) = tmp_home();
-        let id = JdkId::new("external", "some-jdk-1234abcd");
-        let outside = _d.path().join("outside-jdk");
-        std::fs::create_dir_all(&outside).unwrap();
-        std::fs::write(outside.join("marker"), b"keep me").unwrap();
-
-        let mut index = store::load_index(&home).unwrap();
-        let mut rec = rec_with(&id.to_string(), "外部", "21", 21, "");
-        rec.external = true;
-        rec.imported = true;
-        rec.dir = outside.to_string_lossy().into_owned();
-        index.upsert(rec);
-        store::save_index(&home, &index).unwrap();
-
-        uninstall(&home, &id).unwrap();
-        assert!(outside.exists(), "外部 JDK 文件不得删除");
-        assert!(store::load_index(&home).unwrap().get(&id.to_string()).is_none());
+        assert!(store::load_index(&home)
+            .unwrap()
+            .get(&id.to_string())
+            .is_none());
     }
 
     #[test]
@@ -693,10 +654,8 @@ mod tests {
         assert!(bind_project(&home, &proj, &id).unwrap(), "首次绑定是新项目");
         // .jvmrc 已写入
         assert_eq!(
-            crate::project::parse_jvmrc(
-                &std::fs::read_to_string(proj.join(".jvmrc")).unwrap()
-            )
-            .unwrap(),
+            crate::project::parse_jvmrc(&std::fs::read_to_string(proj.join(".jvmrc")).unwrap())
+                .unwrap(),
             id
         );
         // projects.json 已登记
@@ -709,10 +668,8 @@ mod tests {
         assert!(!bind_project(&home, &proj, &other).unwrap());
         assert_eq!(store::load_projects(&home).unwrap().projects.len(), 1);
         assert_eq!(
-            crate::project::parse_jvmrc(
-                &std::fs::read_to_string(proj.join(".jvmrc")).unwrap()
-            )
-            .unwrap(),
+            crate::project::parse_jvmrc(&std::fs::read_to_string(proj.join(".jvmrc")).unwrap())
+                .unwrap(),
             other
         );
 
@@ -730,58 +687,23 @@ mod tests {
         let dir = home.version_dir(&id);
         fake_jdk_at(&dir, "17.0.12");
         let mut index = store::load_index(&home).unwrap();
-        index.upsert(rec_with(&id.to_string(), "temurin", "17.0.12+7", 17, &id.to_dir_name()));
+        index.upsert(rec_with(
+            &id.to_string(),
+            "temurin",
+            "17.0.12+7",
+            17,
+            &id.to_dir_name(),
+        ));
         store::save_index(&home, &index).unwrap();
 
         let mut env = NoopEnvWriter;
         let got = use_dir_with(&home, &dir, &mut env).unwrap();
         assert_eq!(got, id);
         assert_eq!(store::read_default(&home).unwrap().unwrap(), id);
-        // 不新登记外部条目
+        // 索引不新增条目
         assert_eq!(store::load_index(&home).unwrap().installed.len(), 1);
-        assert!(!store::load_index(&home).unwrap().installed[0].external);
         // current 链接与 shim 已就绪
         assert!(home.current().symlink_metadata().is_ok());
         assert!(home.bin().join(installer::exe_name("java")).is_file());
-    }
-
-    #[test]
-    fn use_dir_registers_external_jdk() {
-        let (_d, home) = tmp_home();
-        let outside = _d.path().join("my-external-jdk");
-        fake_jdk_at(&outside, "21.0.1");
-
-        let mut env = NoopEnvWriter;
-        let id = use_dir_with(&home, &outside, &mut env).unwrap();
-        assert_eq!(id.vendor, "external", "外部 JDK 用 external 标识");
-
-        let index = store::load_index(&home).unwrap();
-        assert_eq!(index.installed.len(), 1);
-        let rec = &index.installed[0];
-        assert!(rec.external && rec.imported);
-        assert_eq!(rec.version, "21.0.1", "版本来自 release 文件探测");
-        assert_eq!(rec.vendor, "Test Vendor");
-        assert_eq!(rec.feature, 21);
-        assert_eq!(store::read_default(&home).unwrap().unwrap(), id);
-
-        // 第二次启用同一目录：幂等，不重复登记
-        let id2 = use_dir_with(&home, &outside, &mut env).unwrap();
-        assert_eq!(id, id2);
-        assert_eq!(store::load_index(&home).unwrap().installed.len(), 1);
-
-        // 不是 JDK 的目录被拒绝
-        let not_jdk = _d.path().join("not-a-jdk");
-        std::fs::create_dir_all(&not_jdk).unwrap();
-        assert!(use_dir_with(&home, &not_jdk, &mut env).is_err());
-    }
-
-    #[test]
-    fn external_id_is_stable_and_collision_free() {
-        let a = external_id(Path::new("D:/jdk-a"));
-        let b = external_id(Path::new("D:/jdk-a"));
-        assert_eq!(a, b, "同一路径的标识稳定");
-        let c = external_id(Path::new("D:/jdk-b"));
-        assert_ne!(a, c);
-        assert_eq!(a.vendor, "external");
     }
 }

@@ -156,7 +156,6 @@ struct LocalJdkDto {
     id: Option<String>,
     /// 安装日期（索引 installed_at 转本地时区 YYYY-MM-DD；未登记时为空）
     installed_at: Option<String>,
-    in_install_dir: bool,
     is_current: bool,
 }
 
@@ -221,6 +220,29 @@ async fn get_default_paths() -> Result<PathDefaultsDto, String> {
         install_dir: home.versions().to_string_lossy().into_owned(),
         download_dir: home.downloads().to_string_lossy().into_owned(),
     })
+}
+
+// ---------- 数据目录体检 ----------
+
+/// 体检：检测换根/搬移数据目录后的悬空引用（current、default、目录
+/// 覆盖、JAVA_HOME、PATH），供设置页横幅展示。
+#[tauri::command]
+async fn health_check() -> Result<Vec<jvm_core::health::HealthIssue>, String> {
+    let home = app_home()?;
+    Ok(jvm_core::health::check(&home))
+}
+
+/// 一键修复：清失效的目录覆盖 + 按默认版本完整重切（自愈 current、
+/// 重写 JAVA_HOME/PATH、刷新 shim）。返回执行的动作说明。
+#[tauri::command]
+async fn health_repair(app: AppHandle) -> Result<Vec<String>, String> {
+    let home = app_home()?;
+    let mut env = jvm_core::env::platform_writer(&home.logs());
+    let actions = jvm_core::health::repair(&home, env.as_mut()).map_err(estr)?;
+    for a in &actions {
+        log_evt(&app, "success", a.clone());
+    }
+    Ok(actions)
 }
 
 // ---------- 数据源 ----------
@@ -395,7 +417,6 @@ fn build_local_jdk_dtos(home: &Home) -> Result<Vec<LocalJdkDto>, String> {
                 name: j.name,
                 java_version: j.java_version,
                 vendor: j.vendor,
-                in_install_dir: j.in_install_dir,
             }
         })
         .collect())
@@ -418,7 +439,7 @@ async fn get_current_java_home() -> Result<Option<String>, String> {
     Ok(std::env::var("JAVA_HOME").ok())
 }
 
-/// 启用某目录的 JDK（内部已装版本或外部 JDK）。
+/// 启用某个已安装（索引已登记）的 JDK 目录。
 #[tauri::command]
 async fn use_jdk(app: AppHandle, dir: String) -> Result<(), String> {
     let home = app_home()?;
@@ -430,6 +451,26 @@ async fn use_jdk(app: AppHandle, dir: String) -> Result<(), String> {
     .map_err(estr)?
     .map_err(estr)?;
     log_evt(&app, "success", format!("已设为默认 JDK: {id}"));
+    Ok(())
+}
+
+/// 取消默认版本：default/current/shim/环境变量全部还原，此后终端 java
+/// 回退到系统配置；所有版本因此都可卸载。
+#[tauri::command]
+async fn unset_default(app: AppHandle) -> Result<(), String> {
+    let home = app_home()?;
+    // 链接/shim 删除与注册表写入均为阻塞 IO：放线程池执行
+    let unset = tauri::async_runtime::spawn_blocking(move || flow::unset_default(&home))
+        .await
+        .map_err(estr)?
+        .map_err(estr)?;
+    if unset {
+        log_evt(
+            &app,
+            "info",
+            "已取消默认版本：JAVA_HOME/用户 PATH 不再指向本工具管理的 JDK".to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -735,7 +776,18 @@ async fn bind_project(path: String, id: String) -> Result<bool, String> {
 #[tauri::command]
 async fn unbind_project(path: String) -> Result<bool, String> {
     let home = app_home()?;
-    flow::unbind_project(&home, std::path::Path::new(&path)).map_err(estr)
+    let removed = flow::unbind_project(&home, std::path::Path::new(&path)).map_err(estr)?;
+    // 设置开启时顺带删除项目目录里的 .jvmrc。best-effort：文件不存在或被
+    // 占用都不让解绑整体失败，记日志即可（GUI 弹窗按设置项提示结果语义）
+    if store::load_settings(&home).map_err(estr)?.unbind_deletes_jvmrc {
+        let jvmrc = std::path::Path::new(&path).join(".jvmrc");
+        match std::fs::remove_file(&jvmrc) {
+            Ok(()) => tracing::info!(file = %jvmrc.display(), "已删除 .jvmrc"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(file = %jvmrc.display(), error = %e, "删除 .jvmrc 失败"),
+        }
+    }
+    Ok(removed)
 }
 
 #[tauri::command]
@@ -841,6 +893,8 @@ pub fn run() {
             debug_log,
             get_platform,
             get_default_paths,
+            health_check,
+            health_repair,
             get_distributions,
             get_major_versions,
             get_available_vendors,
@@ -848,6 +902,7 @@ pub fn run() {
             get_local_jdks,
             get_current_java_home,
             use_jdk,
+            unset_default,
             uninstall_jdk,
             open_dir,
             install_jdk,

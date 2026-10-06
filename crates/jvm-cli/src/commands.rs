@@ -1,26 +1,26 @@
-//! jdm 子命令实现（呈现层；业务编排全部委托 `jvm_core::flow`）。
+//! jvm 子命令实现（呈现层；业务编排全部委托 `jvm_core::flow`）。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Subcommand;
+use clap::{CommandFactory, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use jvm_core::downloader::ProgressFn;
 use jvm_core::flow;
 use jvm_core::installer;
-use jvm_core::model::JdkId;
-use jvm_core::source::{from_settings, PkgQuery};
-use jvm_core::store::InstalledJdk;
+use jvm_core::source::{from_settings, PkgQuery, FOOJAY_BASE};
+use jvm_core::store::{RegistryPreset, Settings};
 use jvm_core::{project, shim, store, switcher, Home, Result};
 
 use crate::ui;
 
 #[derive(Subcommand)]
+#[command(disable_help_flag = true)]
 pub enum Cmd {
     /// 列出本地已安装版本
-    Ls,
+    List,
     /// 列出远程可用版本（默认各 LTS 主版本的最新 GA）
-    LsRemote {
+    ListRemote {
         /// 发行商（foojay api_parameter），默认 temurin
         #[arg(short, long)]
         vendor: Option<String>,
@@ -39,57 +39,118 @@ pub enum Cmd {
     Use {
         /// 版本，如 temurin@17.0.12+7 / temurin@17 / 17
         id: String,
+        /// 绑定当前目录（写入 .jvmrc）而非全局默认
         #[arg(long)]
         project: bool,
     },
     /// 安装版本，如 temurin@17 或 temurin@17.0.12+7
     Install {
+        /// 版本，如 temurin@17 / temurin@17.0.12+7
         id: String,
         /// 安装后设为默认
         #[arg(long)]
         default: bool,
     },
     /// 卸载版本
-    Uninstall { id: String },
+    Uninstall {
+        /// 要卸载的版本，如 temurin@17.0.12+7 或 17
+        id: String,
+    },
     /// 打印某命令解析到的实际路径
-    Which { tool: String },
-    /// 导入本机已有 JDK 目录
-    Import {
-        path: PathBuf,
-        /// 显式指定标识，如 temurin@17.0.12+7；缺省按目录名推断
-        #[arg(long = "as")]
-        as_id: Option<String>,
+    Which {
+        /// 工具名，如 java / javac / jar
+        tool: String,
     },
     /// 诊断 PATH / JAVA_HOME / shim 配置
     Doctor,
     /// 打印 jvm 数据目录
     Home,
+    /// 查看与切换数据源（foojay Disco 兼容接口）
+    Config {
+        #[command(subcommand)]
+        cmd: Option<ConfigCmd>,
+    },
+    /// 打印帮助信息或某子命令的帮助
+    Help {
+        /// 要查看帮助的子命令，如 install；缺省打印总帮助
+        cmd: Option<String>,
+    },
 }
 
 pub async fn run(cmd: Cmd, home: &Home) -> Result<()> {
     home.ensure_dirs()?;
     match cmd {
-        Cmd::Ls => ls(home),
-        Cmd::LsRemote {
+        Cmd::List => list(home),
+        Cmd::ListRemote {
             vendor,
             all,
             feature,
             jre,
-        } => ls_remote(home, vendor, all, feature, jre).await,
+        } => list_remote(home, vendor, all, feature, jre).await,
         Cmd::Current => current(home),
         Cmd::Use { id, project } => use_version(home, &id, project).await,
         Cmd::Install { id, default } => install(home, &id, default).await,
         Cmd::Uninstall { id } => uninstall(home, &id),
         Cmd::Which { tool } => which(home, &tool),
-        Cmd::Import { path, as_id } => import(home, &path, as_id),
         Cmd::Doctor => doctor(home),
         Cmd::Home => print_home(home),
+        Cmd::Config { cmd } => config(home, cmd).await,
+        Cmd::Help { cmd } => print_help(cmd.as_deref()),
     }
 }
 
-// ---------- ls ----------
+/// `jvm config` 的子命令；缺省（裸 `jvm config`）等同 `list`。
+/// config 专用于数据源，语法两级：`jvm config <操作> [参数]`。
+/// 预设的增删改语义与 GUI 设置页一致：自定义可删，内置只可编辑。
+#[derive(Subcommand)]
+#[command(disable_help_flag = true)]
+pub(crate) enum ConfigCmd {
+    /// 列出当前数据源与预设
+    List,
+    /// 注册数据源到预设并切换到它
+    Registry {
+        /// 数据源 URL（http/https，foojay Disco 兼容接口）
+        #[arg(long)]
+        url: String,
+        /// 数据源名称，如 内部镜像
+        #[arg(long)]
+        name: String,
+        /// 跳过可达性校验直接保存
+        #[arg(long)]
+        force: bool,
+    },
+    /// 切换数据源（按预设名称或 URL）
+    Use {
+        /// 预设名称或数据源 URL
+        target: String,
+        /// 跳过可达性校验
+        #[arg(long)]
+        force: bool,
+    },
+    /// 编辑预设的名称或 URL（内置预设也可编辑）
+    Edit {
+        /// 要编辑的预设的现有名称
+        name: String,
+        /// 新名称；缺省保持不变
+        #[arg(long = "name")]
+        new_name: Option<String>,
+        /// 新 URL；缺省保持不变
+        #[arg(long = "url")]
+        new_url: Option<String>,
+        /// URL 变更时跳过可达性校验
+        #[arg(long)]
+        force: bool,
+    },
+    /// 删除自定义数据源预设（内置预设不可删除）
+    Remove {
+        /// 要删除的预设的名称
+        name: String,
+    },
+}
 
-fn ls(home: &Home) -> Result<()> {
+// ---------- list ----------
+
+fn list(home: &Home) -> Result<()> {
     let index = store::load_index(home)?;
     if index.installed.is_empty() {
         println!(
@@ -112,17 +173,15 @@ fn ls(home: &Home) -> Result<()> {
             "  ".to_string()
         };
         let lts = if rec.lts { "LTS" } else { "   " };
-        let imported = if rec.imported { "  (导入)" } else { "" };
         // 与 GUI 一致：转本地时区日期（installed_at 是 UTC RFC3339，
         // 直接截取前 10 位在跨日界时区会差一天）
         let date = rec.installed_date().unwrap_or_default();
         println!(
-            "{mark} {:<32} {:>2}  {}  {}{}",
+            "{mark} {:<32} {:>2}  {}  {}",
             rec.id,
             rec.feature,
             lts,
-            ui::dim(&date),
-            imported
+            ui::dim(&date)
         );
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -148,9 +207,9 @@ fn ls(home: &Home) -> Result<()> {
     Ok(())
 }
 
-// ---------- ls-remote ----------
+// ---------- list-remote ----------
 
-async fn ls_remote(
+async fn list_remote(
     home: &Home,
     vendor: Option<String>,
     all: bool,
@@ -188,7 +247,7 @@ async fn ls_remote(
             }
         }
         (true, None) => {
-            println!("--all 需要提供主版本号，例如: jvm ls-remote --all 17");
+            println!("--all 需要提供主版本号，例如: jvm list-remote --all 17");
         }
         (false, Some(f)) => {
             let query = PkgQuery::for_local_machine(&vendor, f).with_image_type(image);
@@ -213,7 +272,7 @@ async fn ls_remote(
             println!(
                 "\n查看某主版本全部更新: {}",
                 ui::accent(format!(
-                    "jvm ls-remote --all {}",
+                    "jvm list-remote --all {}",
                     features.last().copied().unwrap_or(25)
                 ))
             );
@@ -373,53 +432,6 @@ fn which(home: &Home, tool: &str) -> Result<()> {
     Ok(())
 }
 
-// ---------- import ----------
-
-fn import(home: &Home, path: &Path, as_id: Option<String>) -> Result<()> {
-    let id = match as_id {
-        Some(s) => JdkId::parse(&s)?,
-        None => {
-            // 按目录名推断：jdk-17.0.12+7 → local@17.0.12+7
-            let name = path
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let version = name.strip_prefix("jdk-").unwrap_or(&name).trim().to_string();
-            if version.is_empty() {
-                return Err(jvm_core::Error::msg(format!(
-                    "无法从目录名 `{name}` 推断版本，请用 --as <vendor@version> 指定"
-                )));
-            }
-            JdkId::new("local", version)
-        }
-    };
-    println!(
-        "导入 {} 为 {}",
-        ui::dim(path.display()),
-        ui::accent(id.to_string())
-    );
-    let outcome = installer::import_directory(path, &id, home, &installer::run_java_version)?;
-    // 与 GUI 安装共用同一把索引写锁，避免并发安装/登记互相覆盖
-    store::update_index(home, |index| {
-        index.upsert(InstalledJdk {
-            id: id.to_string(),
-            name: format!("{}-{}", id.vendor, id.version),
-            vendor: id.vendor.clone(),
-            version: id.version.clone(),
-            feature: jvm_core::model::version_feature(&id.version).unwrap_or(0),
-            lts: false,
-            dir: outcome.dir_name,
-            java_version_output: outcome.java_version_output,
-            imported: true,
-            external: false,
-            installed_at: chrono::Utc::now().to_rfc3339(),
-        });
-        Ok(())
-    })?;
-    println!("导入完成（标记 imported，卸载只会删除 jvm 内的拷贝）");
-    Ok(())
-}
-
 // ---------- doctor ----------
 
 fn doctor(home: &Home) -> Result<()> {
@@ -446,10 +458,7 @@ fn doctor(home: &Home) -> Result<()> {
                 let dir = store::resolve_dir(home, &rec.dir);
                 match installer::jdk_home_of(&dir) {
                     Some(_) => {
-                        println!(
-                            "{}",
-                            ui::ok(format!("默认版本 {id} → {}", dir.display()))
-                        );
+                        println!("{}", ui::ok(format!("默认版本 {id} → {}", dir.display())));
                         Some(dir)
                     }
                     None => {
@@ -506,7 +515,10 @@ fn doctor(home: &Home) -> Result<()> {
         if !cmd_path.exists() {
             println!(
                 "{}",
-                ui::warn(format!("命令 {} 缺失，执行 jvm use 重建", cmd_path.display()))
+                ui::warn(format!(
+                    "命令 {} 缺失，执行 jvm use 重建",
+                    cmd_path.display()
+                ))
             );
         } else if exe_is_cli {
             if let Some(sz) = exe_size {
@@ -531,15 +543,14 @@ fn doctor(home: &Home) -> Result<()> {
     if default.is_some() {
         let java_shim = home.bin().join(installer::exe_name("java"));
         if java_shim.exists() {
-            match std::process::Command::new(&java_shim).arg("-version").output() {
+            match std::process::Command::new(&java_shim)
+                .arg("-version")
+                .output()
+            {
                 Ok(out) => {
                     let text = String::from_utf8_lossy(&out.stderr).to_string()
                         + &String::from_utf8_lossy(&out.stdout);
-                    println!(
-                        "{} {}",
-                        ui::ok("shim java -version:"),
-                        ui::dim(text.trim())
-                    );
+                    println!("{} {}", ui::ok("shim java -version:"), ui::dim(text.trim()));
                 }
                 Err(e) => {
                     failures += 1;
@@ -652,7 +663,10 @@ fn check_shadowing(home: &Home) {
     #[cfg(windows)]
     let output = std::process::Command::new("where").arg("java").output();
     #[cfg(not(windows))]
-    let output = std::process::Command::new("which").arg("-a").arg("java").output();
+    let output = std::process::Command::new("which")
+        .arg("-a")
+        .arg("java")
+        .output();
 
     if let Ok(out) = output {
         let text = String::from_utf8_lossy(&out.stdout);
@@ -685,4 +699,356 @@ fn print_home(home: &Home) -> Result<()> {
     println!("projects:   {}", home.projects_file().display());
     println!("settings:   {}", home.settings_file().display());
     Ok(())
+}
+
+// ---------- config ----------
+
+/// 数据源专用指令：裸命令列出当前源与预设，操作直接跟在 config 后
+/// （两级语法）。切换/注册前用一次真实的元信息请求校验可达性——存进
+/// 一个打不通的源会让后续 list-remote/install 全部失败；校验失败不落盘
+/// （--force 跳过校验）。
+async fn config(home: &Home, cmd: Option<ConfigCmd>) -> Result<()> {
+    let mut settings = store::load_settings(home)?;
+    match cmd {
+        None | Some(ConfigCmd::List) => registry_list(&settings),
+        Some(ConfigCmd::Registry { url, name, force }) => {
+            registry_add(&mut settings, home, url, name, force).await
+        }
+        Some(ConfigCmd::Use { target, force }) => {
+            registry_use(&mut settings, home, target, force).await
+        }
+        Some(ConfigCmd::Edit {
+            name,
+            new_name,
+            new_url,
+            force,
+        }) => registry_edit(&mut settings, home, name, new_name, new_url, force).await,
+        Some(ConfigCmd::Remove { name }) => registry_remove(&mut settings, home, name),
+    }
+}
+
+/// 列出当前数据源与预设。API 规范靠 URL 匹配判定，不联网。
+fn registry_list(settings: &Settings) -> Result<()> {
+    let current = settings.registry.trim().to_string();
+    let effective = if current.is_empty() {
+        format!("{FOOJAY_BASE}（官方默认）")
+    } else {
+        current.clone()
+    };
+    let spec = from_settings(settings)?.spec_name().to_string();
+    println!("当前数据源: {}", ui::accent(&effective));
+    println!("API 规范:   {}", ui::dim(&spec));
+    if !settings.registry_presets.is_empty() {
+        println!("\n预设:");
+        for p in &settings.registry_presets {
+            let mark = if same_source(&p.url, &current) {
+                ui::accent("->")
+            } else {
+                "  ".to_string()
+            };
+            let tag = if p.built_in {
+                ui::dim("（内置）")
+            } else {
+                String::new()
+            };
+            println!("{mark} {:<26} {}{}", p.name, ui::dim(&p.url), tag);
+        }
+        println!(
+            "\n切换: {}\n注册: {}\n编辑: {}\n删除: {}",
+            ui::accent("jvm config use <名称|URL>"),
+            ui::accent("jvm config registry --url <URL> --name <名称>"),
+            ui::accent("jvm config edit <名称> [--name 新名] [--url 新URL]"),
+            ui::accent("jvm config remove <名称>")
+        );
+    }
+    Ok(())
+}
+
+/// 注册数据源（对齐 GUI「添加数据源」：起名 → 校验 → 入列预设 → 启用）。
+/// URL 不得与现有预设重复；自定义预设可被 remove 删除。
+async fn registry_add(
+    settings: &mut Settings,
+    home: &Home,
+    url: String,
+    name: String,
+    force: bool,
+) -> Result<()> {
+    let name = name.trim();
+    let url = url.trim().trim_end_matches('/');
+    if name.is_empty() || url.is_empty() {
+        return Err(jvm_core::Error::msg("数据源需要名称与 URL"));
+    }
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(jvm_core::Error::msg(format!(
+            "URL 需以 http:// 或 https:// 开头: {url}"
+        )));
+    }
+    if let Some(p) = settings
+        .registry_presets
+        .iter()
+        .find(|p| same_source(&p.url, url))
+    {
+        return Err(jvm_core::Error::msg(format!(
+            "该 URL 已在预设中: {}（{}）",
+            p.name, p.url
+        )));
+    }
+
+    // 可达性校验：临时把新 URL 填进注册表字段构建源，失败不落盘。
+    let saved_registry = std::mem::replace(&mut settings.registry, url.to_string());
+    let source = from_settings(settings)?;
+    if !force {
+        println!("校验数据源（{}）…", ui::dim(source.spec_name()));
+        match source.distributions().await {
+            Ok(list) => println!("可达，{} 个发行版元信息", list.len()),
+            Err(e) => {
+                settings.registry = saved_registry;
+                return Err(jvm_core::Error::msg(format!(
+                    "数据源不可达: {e}；确认 URL 与网络后重试，或加 --force 跳过校验"
+                )));
+            }
+        }
+    }
+    settings.registry_presets.push(RegistryPreset {
+        name: name.to_string(),
+        url: url.to_string(),
+        built_in: false,
+    });
+    store::save_settings(home, settings)?;
+    println!(
+        "已注册数据源并切换: {}（{}，API 规范 {}）",
+        ui::accent(name),
+        ui::accent(url),
+        ui::dim(source.spec_name())
+    );
+    Ok(())
+}
+
+/// 切换数据源。参数先按预设名称解析（GUI 里的预设由此真正可用），
+/// 未命中再按 URL 处理；目标与当前一致时直接短路。
+async fn registry_use(
+    settings: &mut Settings,
+    home: &Home,
+    target: String,
+    force: bool,
+) -> Result<()> {
+    let t = target.trim().to_string();
+    let preset = settings
+        .registry_presets
+        .iter()
+        .find(|p| preset_matches(p, &t));
+    let (url, via_preset) = match preset {
+        Some(p) => (p.url.trim().to_string(), Some(p.name.clone())),
+        None => {
+            if t.starts_with("http://") || t.starts_with("https://") {
+                (t, None)
+            } else {
+                return Err(jvm_core::Error::msg(format!(
+                    "既不是预设名称也不是有效的 URL: {t}（jvm config 查看预设列表）"
+                )));
+            }
+        }
+    };
+    if same_source(&url, &settings.registry.trim()) {
+        println!(
+            "已是当前数据源: {}",
+            ui::accent(if url.is_empty() { FOOJAY_BASE } else { &url })
+        );
+        return Ok(());
+    }
+
+    // 校验可达后才写回；失败即返回，磁盘上的设置不受影响。
+    let saved_registry = std::mem::replace(&mut settings.registry, url.clone());
+    let source = from_settings(settings)?;
+    if !force {
+        println!("校验数据源（{}）…", ui::dim(source.spec_name()));
+        match source.distributions().await {
+            Ok(list) => println!("可达，{} 个发行版元信息", list.len()),
+            Err(e) => {
+                settings.registry = saved_registry;
+                return Err(jvm_core::Error::msg(format!(
+                    "数据源不可达: {e}；确认 URL 与网络后重试，或加 --force 跳过校验"
+                )));
+            }
+        }
+    }
+    store::save_settings(home, settings)?;
+    let shown = if url.is_empty() {
+        format!("{FOOJAY_BASE}（官方默认）")
+    } else {
+        url
+    };
+    match via_preset {
+        Some(n) => println!(
+            "数据源已切换: {}（预设 {}，API 规范 {}）",
+            ui::accent(shown),
+            ui::accent(n),
+            ui::dim(source.spec_name())
+        ),
+        None => println!(
+            "数据源已切换: {}（API 规范 {}）",
+            ui::accent(shown),
+            ui::dim(source.spec_name())
+        ),
+    }
+    Ok(())
+}
+
+/// 预设名称匹配：精确或 ASCII 大小写不敏感。
+fn preset_matches(p: &RegistryPreset, t: &str) -> bool {
+    let n = p.name.trim();
+    n == t || n.eq_ignore_ascii_case(t)
+}
+
+/// 编辑预设的名称或 URL（对齐 GUI「编辑数据源」：内置预设也可编辑）。
+/// URL 变更时校验可达性（--force 跳过）；被编辑的是当前源时，
+/// 当前源跟着指向新 URL。
+async fn registry_edit(
+    settings: &mut Settings,
+    home: &Home,
+    name: String,
+    new_name: Option<String>,
+    new_url: Option<String>,
+    force: bool,
+) -> Result<()> {
+    let t = name.trim();
+    let idx = settings
+        .registry_presets
+        .iter()
+        .position(|p| preset_matches(p, t))
+        .ok_or_else(|| {
+            jvm_core::Error::msg(format!("未找到预设: {t}（jvm config 查看预设列表）"))
+        })?;
+    let old_name = settings.registry_presets[idx].name.clone();
+    let old_url = settings.registry_presets[idx].url.clone();
+    let new_name = new_name
+        .map(|n| n.trim().to_string())
+        .unwrap_or_else(|| old_name.clone());
+    // URL 归一化去尾斜杠（与 GUI 编辑保存行为一致）
+    let new_url = new_url
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .unwrap_or_else(|| old_url.clone());
+    if new_name.is_empty() || new_url.is_empty() {
+        return Err(jvm_core::Error::msg("名称与 URL 不能为空"));
+    }
+    if !new_url.starts_with("http://") && !new_url.starts_with("https://") {
+        return Err(jvm_core::Error::msg(format!(
+            "URL 需以 http:// 或 https:// 开头: {new_url}"
+        )));
+    }
+    if let Some(p) = settings
+        .registry_presets
+        .iter()
+        .enumerate()
+        .find(|(i, p)| *i != idx && same_source(&p.url, &new_url))
+        .map(|(_, p)| p)
+    {
+        return Err(jvm_core::Error::msg(format!(
+            "该 URL 已在预设中: {}（{}）",
+            p.name, p.url
+        )));
+    }
+
+    let url_changed = !same_source(&old_url, &new_url);
+    let was_current = same_source(&old_url, &settings.registry.trim());
+    // URL 变更时先临时换上用于校验；非当前源的预设编辑完成后要还原。
+    let saved_registry = std::mem::replace(&mut settings.registry, new_url.clone());
+    let source = from_settings(settings)?;
+    if url_changed && !force {
+        println!("校验数据源（{}）…", ui::dim(source.spec_name()));
+        match source.distributions().await {
+            Ok(list) => println!("可达，{} 个发行版元信息", list.len()),
+            Err(e) => {
+                settings.registry = saved_registry;
+                return Err(jvm_core::Error::msg(format!(
+                    "数据源不可达: {e}；确认 URL 与网络后重试，或加 --force 跳过校验"
+                )));
+            }
+        }
+    }
+    if !was_current {
+        settings.registry = saved_registry;
+    }
+    {
+        let p = &mut settings.registry_presets[idx];
+        p.name = new_name.clone();
+        p.url = new_url.clone();
+    }
+    store::save_settings(home, settings)?;
+    println!(
+        "已编辑预设: {} → {}（{}）{}",
+        ui::dim(&old_name),
+        ui::accent(&new_name),
+        ui::accent(&new_url),
+        if was_current {
+            ui::dim("，为当前数据源")
+        } else {
+            String::new()
+        }
+    );
+    Ok(())
+}
+
+/// 删除自定义预设；当前源被删时回退官方默认（与 GUI 行为一致）。
+fn registry_remove(settings: &mut Settings, home: &Home, name: String) -> Result<()> {
+    let t = name.trim();
+    let idx = settings
+        .registry_presets
+        .iter()
+        .position(|p| preset_matches(p, t))
+        .ok_or_else(|| {
+            jvm_core::Error::msg(format!("未找到预设: {t}（jvm config 查看预设列表）"))
+        })?;
+    if settings.registry_presets[idx].built_in {
+        return Err(jvm_core::Error::msg(format!(
+            "内置预设不可删除: {}（可在 GUI 设置页编辑名称/地址）",
+            settings.registry_presets[idx].name
+        )));
+    }
+    let removed = settings.registry_presets.remove(idx);
+    let mut note = String::new();
+    if same_source(&removed.url, &settings.registry.trim()) {
+        settings.registry = String::new();
+        note = "；它是当前数据源，已回退官方默认".to_string();
+    }
+    store::save_settings(home, settings)?;
+    println!(
+        "已删除预设: {}（{}）{}",
+        ui::accent(&removed.name),
+        ui::dim(&removed.url),
+        note
+    );
+    Ok(())
+}
+
+/// 两个数据源 URL 是否指向同一处：去空白与尾斜杠后比较；
+/// 空串与官方 Foojay 地址等价（settings 中空 = 官方默认）。
+fn same_source(a: &str, b: &str) -> bool {
+    let norm = |u: &str| u.trim().trim_end_matches('/').to_string();
+    let (a, b) = (norm(a), norm(b));
+    if a == b {
+        return true;
+    }
+    let official = FOOJAY_BASE.trim_end_matches('/');
+    (a.is_empty() && b == official) || (b.is_empty() && a == official)
+}
+
+// ---------- help ----------
+
+/// 打印帮助：接管 clap 内建 help 子命令的职责（内建版引导文案是英文，
+/// 与全中文的命令描述不一致）。从同一份 Command 树渲染，保证
+/// `jvm help` / `jvm help <子命令>` 与 `--help` 输出的语言、命名
+/// （jvm 而非 jvm.exe）与版式一致。
+fn print_help(target: Option<&str>) -> Result<()> {
+    let mut root = crate::Cli::command();
+    root.build();
+    match target {
+        None => Ok(root.print_help()?),
+        Some(name) => {
+            let sub = root.find_subcommand_mut(name).ok_or_else(|| {
+                jvm_core::Error::msg(format!("未知命令: {name}（jvm --help 查看全部命令）"))
+            })?;
+            Ok(sub.print_help()?)
+        }
+    }
 }

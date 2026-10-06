@@ -29,6 +29,11 @@ winreg = "0.55"
 junction = "1.2"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
+[profile.dev]
+# 只保留行号表，不生成完整调试符号：Windows/MSVC 下完整 pdb 单文件可达百 MB 级，
+# 是 target 膨胀的主因。需要 IDE 断点查看变量时临时改成 debug = true。
+debug = "line-tables-only"
+
 [profile.release]
 lto = "thin"
 strip = true

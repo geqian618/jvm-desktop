@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { useAppStore } from "../stores/app";
 import { useDialogStore } from "../stores/dialog";
@@ -20,6 +20,22 @@ const selected = ref<Set<string>>(new Set());
 
 const boundJdkIds = computed(() =>
   [...new Set(store.projects.map((p) => p.jdk))].sort(),
+);
+
+// 解绑是否连带删除 .jvmrc：跟随设置项，确认弹窗文案随之切换
+const deletesJvmrc = computed(() => store.config?.unbindDeletesJvmrc ?? false);
+
+// 默认选中第一个已安装版本；当前选中的 id 已不在列表中（被卸载、
+// 列表刷新变空）时同样归位——否则残留值既匹配不到选项（控件空白）、
+// 又会阻止占位项渲染。列表到达前或为空时显示占位提示
+watch(
+  () => store.installedIds,
+  (ids) => {
+    if (!newId.value || !ids.includes(newId.value)) {
+      newId.value = ids[0] ?? "";
+    }
+  },
+  { immediate: true },
 );
 
 const filteredProjects = computed(() => {
@@ -92,7 +108,9 @@ async function open(path: string) {
 async function remove(path: string) {
   const ok = await dialog.confirm({
     title: t("projects.unbind"),
-    message: t("projects.confirmUnbind"),
+    message: t(
+      deletesJvmrc.value ? "projects.confirmUnbindDelete" : "projects.confirmUnbind",
+    ),
     kind: "warning",
     danger: true,
     confirmText: t("projects.unbind"),
@@ -105,7 +123,12 @@ async function removeSelected() {
   if (paths.length === 0) return;
   const ok = await dialog.confirm({
     title: t("projects.unbindSelected"),
-    message: t("projects.confirmUnbindMany", { n: paths.length }),
+    message: t(
+      deletesJvmrc.value
+        ? "projects.confirmUnbindManyDelete"
+        : "projects.confirmUnbindMany",
+      { n: paths.length },
+    ),
     kind: "warning",
     danger: true,
     confirmText: t("projects.unbindSelected"),
@@ -145,13 +168,12 @@ onMounted(async () => {
       <div class="bind-row">
         <button class="btn-ghost btn-sm" @click="pick">{{ t("projects.pick") }}</button>
         <input v-model="newPath" type="text" class="ctl mono grow" :placeholder="t('projects.pathPlaceholder')" />
+        <!-- 原生 select 无 placeholder：没有选中值时就显示空白 -->
         <select v-model="newId" class="ctl w-jdk">
-          <option value="" disabled>{{ t("projects.jdkPlaceholder") }}</option>
           <option v-for="id in store.installedIds" :key="id" :value="id">{{ id }}</option>
         </select>
         <button class="btn-primary btn-sm" @click="add">{{ t("projects.bind") }}</button>
       </div>
-      <p class="tip">{{ t("projects.tip") }}</p>
     </div>
 
     <div v-if="store.projects.length === 0" class="empty">
@@ -250,7 +272,7 @@ h2 {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 12px 16px;
+  padding: 16px;
   margin-bottom: 14px;
 }
 
@@ -274,6 +296,11 @@ h2 {
   width: 260px;
 }
 
+/* 绑定行的 JDK 下拉窄一些，省出的宽度由前面的路径输入框（flex:1）吸收 */
+.bind-card .w-jdk {
+  width: 180px;
+}
+
 /* 筛选栏 */
 .filters {
   display: flex;
@@ -295,13 +322,6 @@ h2 {
 .w-check {
   width: 36px;
   text-align: center;
-}
-
-.tip {
-  margin-top: 8px;
-  font-size: 12px;
-  color: var(--text2);
-  line-height: 1.7;
 }
 
 .empty {

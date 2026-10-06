@@ -5,7 +5,7 @@
 //! JDK8 内嵌的 `jre/` 子目录被当成独立 JDK（路径经 junction 别名后连
 //! 嵌套剪枝都失效），厂商还会从 `java -version` 输出解析出 `(build`
 //! 之类的垃圾值。已按产品决策移除外部扫描：本地列表只加载 `versions/`
-//! 下的目录；站外 JDK 请用「导入」拷入安装目录统一管理。
+//! 下的目录。
 //!
 //! 探测规则：存在 `bin/java(.exe)` 才算 JDK；版本/厂商优先读 `release`
 //! 文件（发行商写入的 JAVA_VERSION / IMPLEMENTOR），缺失时回退执行
@@ -29,9 +29,6 @@ pub struct ScannedJdk {
     pub name: String,
     pub java_version: Option<String>,
     pub vendor: Option<String>,
-    /// 是否位于应用安装目录内（扫描仅覆盖安装目录，恒为 true；
-    /// 索引中的外部 JDK 记录仍依赖该字段语义，故保留）。
-    pub in_install_dir: bool,
 }
 
 fn java_exe(dir: &Path) -> PathBuf {
@@ -116,8 +113,6 @@ pub fn scan_local(home: &Home) -> Vec<ScannedJdk> {
                 name,
                 java_version: probe.java_version,
                 vendor: probe.vendor,
-                // 扫描只覆盖安装目录，恒为 true。
-                in_install_dir: true,
             });
         }
     }
@@ -163,7 +158,10 @@ mod tests {
         {
             std::fs::write(dir.path().join("bin/java"), b"#!/bin/sh\n").unwrap();
             let probe = probe_dir(dir.path()).unwrap();
-            assert!(probe.java_version.is_none(), "无 release 文件且无法执行时版本为空");
+            assert!(
+                probe.java_version.is_none(),
+                "无 release 文件且无法执行时版本为空"
+            );
         }
     }
 
@@ -214,7 +212,11 @@ mod tests {
         std::fs::write(jdk8.join("bin").join(exe_name("java")), b"x").unwrap();
         std::fs::write(jdk8.join("jre").join("bin").join(exe_name("java")), b"x").unwrap();
         std::fs::write(jdk8.join("release"), "JAVA_VERSION=\"1.8.0_342\"\n").unwrap();
-        std::fs::write(jdk8.join("jre").join("release"), "JAVA_VERSION=\"1.8.0_342\"\n").unwrap();
+        std::fs::write(
+            jdk8.join("jre").join("release"),
+            "JAVA_VERSION=\"1.8.0_342\"\n",
+        )
+        .unwrap();
 
         let jdk17 = home.versions().join("temurin_17.0.20.1_1");
         std::fs::create_dir_all(jdk17.join("bin")).unwrap();
@@ -242,8 +244,10 @@ mod tests {
             vec!["temurin_17.0.20.1_1", "oracle_open_jdk-8.0.342_7"],
             "只加载 versions/ 下的 JDK，内嵌 jre 被剔除，按版本降序"
         );
-        assert!(found.iter().all(|j| j.in_install_dir));
-        let rec = found.iter().find(|j| j.name == "temurin_17.0.20.1_1").unwrap();
+        let rec = found
+            .iter()
+            .find(|j| j.name == "temurin_17.0.20.1_1")
+            .unwrap();
         assert_eq!(rec.vendor.as_deref(), Some("Eclipse Adoptium"));
         assert_eq!(rec.java_version.as_deref(), Some("17.0.20.1"));
     }

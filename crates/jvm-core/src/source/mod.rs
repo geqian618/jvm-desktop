@@ -99,11 +99,7 @@ pub trait RegistrySource: Send + Sync {
     async fn latest_for_feature(&self, query: &PkgQuery) -> Result<Option<Release>>;
 
     /// 精确版本 → Release；同时补全下载直链与校验和。
-    async fn package_for_exact(
-        &self,
-        query: &PkgQuery,
-        version: &str,
-    ) -> Result<Option<Release>>;
+    async fn package_for_exact(&self, query: &PkgQuery, version: &str) -> Result<Option<Release>>;
 
     /// 拉取一个发行商在指定平台/归档类型下的全部 GA 包（不带 version 参数，
     /// 规范自行决定单请求还是按主版本聚合；大版本/维护状态/支持类型筛选由
@@ -136,7 +132,12 @@ pub trait RegistrySource: Send + Sync {
         Ok(majors
             .iter()
             .filter(|m| m.maintained)
-            .map(|m| (m.major_version, m.term_of_support.eq_ignore_ascii_case("lts")))
+            .map(|m| {
+                (
+                    m.major_version,
+                    m.term_of_support.eq_ignore_ascii_case("lts"),
+                )
+            })
             .collect())
     }
 

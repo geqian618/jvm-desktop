@@ -16,7 +16,8 @@ use crate::model::{Release, RemotePackage};
 pub struct AdoptiumSource {
     base: String,
     client: reqwest::Client,
-}#[derive(Deserialize)]
+}
+#[derive(Deserialize)]
 struct AsReleases {
     #[serde(default)]
     available_releases: Vec<u32>,
@@ -121,7 +122,11 @@ impl AdoptiumSource {
             vendor: "temurin".to_string(),
             version: version.clone(),
             feature,
-            term: if lts { "LTS".to_string() } else { "STS".to_string() },
+            term: if lts {
+                "LTS".to_string()
+            } else {
+                "STS".to_string()
+            },
             lts,
             package: RemotePackage {
                 os: os.to_string(),
@@ -177,18 +182,19 @@ impl RegistrySource for AdoptiumSource {
     async fn latest_for_feature(&self, query: &PkgQuery) -> Result<Option<Release>> {
         let lts = self.is_lts(query.feature).await;
         let assets = self.assets(query, true).await?;
-        Ok(assets
-            .first()
-            .and_then(|a| {
-                Self::asset_to_release(a, query.feature, lts, &query.os, &query.arch, &query.image_type)
-            }))
+        Ok(assets.first().and_then(|a| {
+            Self::asset_to_release(
+                a,
+                query.feature,
+                lts,
+                &query.os,
+                &query.arch,
+                &query.image_type,
+            )
+        }))
     }
 
-    async fn package_for_exact(
-        &self,
-        query: &PkgQuery,
-        version: &str,
-    ) -> Result<Option<Release>> {
+    async fn package_for_exact(&self, query: &PkgQuery, version: &str) -> Result<Option<Release>> {
         let lts = self.is_lts(query.feature).await;
         let want = format!("jdk-{version}");
         let assets = self.assets(query, false).await?;
@@ -196,7 +202,14 @@ impl RegistrySource for AdoptiumSource {
             .iter()
             .find(|a| a.release_name == want)
             .and_then(|a| {
-                Self::asset_to_release(a, query.feature, lts, &query.os, &query.arch, &query.image_type)
+                Self::asset_to_release(
+                    a,
+                    query.feature,
+                    lts,
+                    &query.os,
+                    &query.arch,
+                    &query.image_type,
+                )
             }))
     }
 
@@ -245,7 +258,11 @@ impl RegistrySource for AdoptiumSource {
             .map(|m| m.major_version)
             .collect();
 
-        let suffix = if archive_type == "zip" { ".zip" } else { ".tar.gz" };
+        let suffix = if archive_type == "zip" {
+            ".zip"
+        } else {
+            ".tar.gz"
+        };
         let queries: Vec<PkgQuery> = majors
             .iter()
             .map(|m| PkgQuery {
@@ -331,13 +348,11 @@ impl RegistrySource for AdoptiumSource {
 
 impl AdoptiumSource {
     async fn is_lts(&self, feature: u32) -> bool {
-        self.major_versions()
-            .await
-            .is_ok_and(|majors| {
-                majors
-                    .iter()
-                    .any(|m| m.major_version == feature && m.term_of_support == "LTS")
-            })
+        self.major_versions().await.is_ok_and(|majors| {
+            majors
+                .iter()
+                .any(|m| m.major_version == feature && m.term_of_support == "LTS")
+        })
     }
 }
 
@@ -373,15 +388,9 @@ mod tests {
             "link":"https://github.com/x/y.zip","size":189575306,
             "checksum":"e53a79c3c3d86865bd7e787903884331068e71321714ffd44f145785affc7cb0"}}]}]"#;
         let assets: Vec<AsAsset> = serde_json::from_str(body).unwrap();
-        let release = AdoptiumSource::asset_to_release(
-            &assets[0],
-            17,
-            true,
-            "windows",
-            "x64",
-            "jdk",
-        )
-        .unwrap();
+        let release =
+            AdoptiumSource::asset_to_release(&assets[0], 17, true, "windows", "x64", "jdk")
+                .unwrap();
         assert_eq!(release.version, "17.0.12+7");
         assert_eq!(release.vendor, "temurin");
         assert_eq!(

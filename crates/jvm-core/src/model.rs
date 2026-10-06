@@ -112,10 +112,7 @@ impl VersionRef {
 
 /// 从版本串提取主版本号：`17.0.12+7` → 17，`25-ea+9` → 25。
 pub fn version_feature(version: &str) -> Option<u32> {
-    let head: String = version
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
+    let head: String = version.chars().take_while(|c| c.is_ascii_digit()).collect();
     head.parse().ok()
 }
 
@@ -216,7 +213,11 @@ pub fn platform_archive_type() -> &'static str {
 
 /// 下载文件名推测（源未给 filename 时的兜底）。
 pub fn archive_filename(id: &JdkId, archive_type: &str) -> String {
-    let ext = if archive_type == "zip" { "zip" } else { "tar.gz" };
+    let ext = if archive_type == "zip" {
+        "zip"
+    } else {
+        "tar.gz"
+    };
     format!("{}.{}", id.to_dir_name(), ext)
 }
 
@@ -228,9 +229,7 @@ impl Serialize for JdkId {
 }
 
 impl<'de> Deserialize<'de> for JdkId {
-    fn deserialize<D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         JdkId::parse(&s).map_err(serde::de::Error::custom)
     }
@@ -286,10 +285,22 @@ mod tests {
 
     #[test]
     fn version_ordering() {
-        assert_eq!(cmp_versions("17.0.12+7", "17.0.12+8"), std::cmp::Ordering::Less);
-        assert_eq!(cmp_versions("17.0.20.1+1", "17.0.12+7"), std::cmp::Ordering::Greater);
-        assert_eq!(cmp_versions("17.0.12+7", "17.0.12"), std::cmp::Ordering::Greater);
-        assert_eq!(cmp_versions("8.0.1+3", "8.0.1+3"), std::cmp::Ordering::Equal);
+        assert_eq!(
+            cmp_versions("17.0.12+7", "17.0.12+8"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            cmp_versions("17.0.20.1+1", "17.0.12+7"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            cmp_versions("17.0.12+7", "17.0.12"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            cmp_versions("8.0.1+3", "8.0.1+3"),
+            std::cmp::Ordering::Equal
+        );
     }
 
     #[test]

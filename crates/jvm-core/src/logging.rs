@@ -15,8 +15,8 @@ pub fn init(home: &Home) -> Option<WorkerGuard> {
     }
     let appender = tracing_appender::rolling::daily(home.logs(), "jvm.log");
     let (writer, guard) = tracing_appender::non_blocking(appender);
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,jvm=info"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,jvm=info"));
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_env_filter(filter)

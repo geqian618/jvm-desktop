@@ -5,7 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { CONFIG_FALLBACK, useAppStore } from "../stores/app";
 import { useDialogStore } from "../stores/dialog";
 import { api } from "../api";
-import type { PathDefaults, RegistryPreset } from "../types";
+import type { HealthIssue, PathDefaults, RegistryPreset } from "../types";
 
 const { t } = useI18n();
 const store = useAppStore();
@@ -35,6 +35,45 @@ watch(
 
 // 设置留空时后端实际生效的默认目录（输入框占位展示 + 一键填入的来源）
 const defaults = ref<PathDefaults | null>(null);
+
+// ---------- 数据目录体检 ----------
+// 换根/搬移数据目录后，current 链接、目录覆盖、JAVA_HOME 等绝对路径引用
+// 会悬空；进入设置页时检测，发现问题给出「一键修复」。
+
+const healthIssues = ref<HealthIssue[]>([]);
+const healthRepairing = ref(false);
+const healthRepaired = ref<string[]>([]);
+
+const hasFixableIssue = computed(() => healthIssues.value.some((i) => i.fixable));
+
+async function runHealthCheck() {
+  try {
+    healthRepaired.value = [];
+    healthIssues.value = await api.healthCheck();
+  } catch {
+    healthIssues.value = []; // 检测失败不打扰用户
+  }
+}
+
+async function runHealthRepair() {
+  healthRepairing.value = true;
+  try {
+    healthRepaired.value = await api.healthRepair();
+    await runHealthCheck();
+    // 修复可能清空了失效的目录覆盖，重拉设置同步输入框；
+    // current/环境变量重建后本地列表与 JAVA_HOME 展示也要刷新
+    await store.reloadConfig();
+    await store.refreshLocal();
+  } catch (e) {
+    dialog.alert({
+      title: t("settings.healthFixFailTitle"),
+      message: String(e),
+    });
+  } finally {
+    healthRepairing.value = false;
+  }
+}
+
 onMounted(async () => {
   try {
     // 仅作占位展示与「一键填入」来源，不写回配置：留空 = 跟随后端动态
@@ -44,10 +83,28 @@ onMounted(async () => {
   } catch {
     /* 拿不到就不显示占位与默认按钮 */
   }
+  void runHealthCheck();
 });
 
 function applyPreset(url: string) {
   cfg.value.registry = url;
+}
+
+/// 路径输入框只读，路径变更只能经「浏览…」或「默认」到达这里。
+/// 不做自动迁移——万一选错目录会把整个目录的数据一起搬过去；改为
+/// 提醒用户手动拷贝需要的数据到新目录，拷什么、拷多少由用户自己决定。
+async function changePath(field: "installDir" | "downloadDir", rawTarget: string) {
+  const target = rawTarget.trim();
+  const from = (cfg.value[field] || "").trim();
+  if (!target || target === from) return;
+  cfg.value[field] = target;
+  if (from) {
+    dialog.alert({
+      title: t("settings.pathChangedTitle"),
+      message: t("settings.pathChangedHint", { from, to: target }),
+    });
+    store.log("info", t("settings.pathChangedLog", { from, to: target }));
+  }
 }
 
 async function browseDir(field: "installDir" | "downloadDir") {
@@ -55,13 +112,13 @@ async function browseDir(field: "installDir" | "downloadDir") {
   const start = cfg.value[field] || undefined;
   const sel = await open({ directory: true, multiple: false, defaultPath: start });
   if (typeof sel === "string") {
-    cfg.value[field] = sel;
+    await changePath(field, sel);
   }
 }
 
 function applyDefault(field: "installDir" | "downloadDir") {
   if (!defaults.value) return;
-  cfg.value[field] = defaults.value[field];
+  void changePath(field, defaults.value[field]);
 }
 
 // ---------- 自定义数据源 ----------
@@ -156,6 +213,34 @@ async function removeSource(index: number) {
     </div>
 
     <div class="settings-scroll">
+      <!-- 数据目录体检横幅：发现悬空引用时置顶提示，可一键修复 -->
+      <section v-if="healthIssues.length" class="card health-banner">
+        <div class="health-head">
+          <span class="health-title">
+            {{ t("settings.healthTitle", { n: healthIssues.length }) }}
+          </span>
+          <button
+            v-if="hasFixableIssue"
+            class="btn-primary btn-sm"
+            :disabled="healthRepairing"
+            @click="runHealthRepair"
+          >
+            {{ healthRepairing ? t("settings.healthFixing") : t("settings.healthFix") }}
+          </button>
+        </div>
+        <ul class="health-list">
+          <li v-for="issue in healthIssues" :key="issue.code + issue.message">
+            <span class="health-msg">{{ issue.message }}</span>
+            <span v-if="!issue.fixable" class="health-manual">
+              {{ t("settings.healthManual") }}
+            </span>
+          </li>
+        </ul>
+        <p v-if="healthRepaired.length" class="health-done">
+          {{ t("settings.healthFixed") }}{{ healthRepaired.join("；") }}
+        </p>
+      </section>
+
       <section class="card">
       <h3>{{ t("settings.general") }}</h3>
 
@@ -183,6 +268,7 @@ async function removeSource(index: number) {
               v-model="cfg.installDir"
               type="text"
               class="ctl mono"
+              readonly
               :placeholder="defaults?.installDir || ''"
             />
             <button
@@ -210,6 +296,7 @@ async function removeSource(index: number) {
               v-model="cfg.downloadDir"
               type="text"
               class="ctl mono"
+              readonly
               :placeholder="defaults?.downloadDir || ''"
             />
             <button
@@ -234,6 +321,19 @@ async function removeSource(index: number) {
         <div class="row-control">
           <label class="switch">
             <input v-model="cfg.autoCleanDownload" type="checkbox" />
+            <span class="track" />
+          </label>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="row-main">
+          <div class="row-title">{{ t("settings.unbindDelete") }}</div>
+          <div class="row-desc">{{ t("settings.unbindDeleteHint") }}</div>
+        </div>
+        <div class="row-control">
+          <label class="switch">
+            <input v-model="cfg.unbindDeletesJvmrc" type="checkbox" />
             <span class="track" />
           </label>
         </div>
@@ -406,6 +506,59 @@ h2 {
 
 .spacer {
   flex: 1;
+}
+
+/* 体检横幅：发现问题置顶展示，警告色调 */
+.health-banner {
+  border-color: rgba(214, 158, 46, 0.5);
+  background: rgba(214, 158, 46, 0.06);
+}
+
+.health-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-top: 14px;
+}
+
+.health-title {
+  flex: 1;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.health-list {
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.health-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 5px 0;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--text2);
+}
+
+.health-msg {
+  flex: 1;
+  min-width: 0;
+}
+
+.health-manual {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--danger);
+}
+
+.health-done {
+  margin: 10px 0 6px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--ok);
 }
 
 /* 分组卡片：撑满窗口内容区宽度 */

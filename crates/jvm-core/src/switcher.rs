@@ -11,7 +11,9 @@ use crate::model::JdkId;
 use crate::store::{self, InstalledJdk};
 
 /// shim 覆盖的高频命令；其余工具靠 JAVA_HOME（mvn/gradle 等自读）。
-pub const SHIM_TOOLS: [&str; 7] = ["java", "javac", "jar", "jshell", "jlink", "jpackage", "javaw"];
+pub const SHIM_TOOLS: [&str; 7] = [
+    "java", "javac", "jar", "jshell", "jlink", "jpackage", "javaw",
+];
 
 /// CLI 自身进驻 `bin/` 时使用的文件名（与工具 shim 同目录）。
 pub const CLI_COMMAND: &str = "jvm";
@@ -52,8 +54,8 @@ pub fn switch_to(home: &Home, id: &JdkId, env: &mut dyn UserEnvWriter) -> Result
     if !dir.is_dir() {
         return Err(Error::IndexOutOfSync(dir.display().to_string()));
     }
-    let jdk_home =
-        installer::jdk_home_of(&dir).ok_or_else(|| Error::IndexOutOfSync(dir.display().to_string()))?;
+    let jdk_home = installer::jdk_home_of(&dir)
+        .ok_or_else(|| Error::IndexOutOfSync(dir.display().to_string()))?;
 
     // 顺序：先重建 current 链接与 shim，最后才写 default——链接重建失败
     // （如残留非 junction 条目、目标被占用）时 default 仍指向旧版本，状态
@@ -106,10 +108,78 @@ pub fn switch_to(home: &Home, id: &JdkId, env: &mut dyn UserEnvWriter) -> Result
     Ok(outcome)
 }
 
+/// 取消默认版本：移除 default 登记、current 链接与工具 shim，并清理本
+/// 工具写入的用户环境变量（JAVA_HOME 仅在仍指向 current 链接时删除，
+/// 用户自配的值不动）。本就没有默认版本时返回 Ok(false)。
+///
+/// 与 [`switch_to`] 的顺序相反（先摘链接后删 default）：任一步失败都
+/// 不会留下「default 已消失但链接/环境仍指向本工具」的中间态。
+pub fn unset_default(home: &Home, env: &mut dyn UserEnvWriter) -> Result<bool> {
+    if store::read_default(home)?.is_none() {
+        return Ok(false);
+    }
+
+    // current 链接：仅当确为链接时删除（remove_dir 只删联接本身，
+    // 不会递归删除目标内容），绝不动真实目录；残留的普通空目录直接
+    // 清除，非空目录保持报错（可能是解引用搬移的真实内容，不自动删）。
+    let link = home.current();
+    if let Ok(meta) = link.symlink_metadata() {
+        if !meta.file_type().is_symlink() {
+            if !link.is_dir()
+                || std::fs::read_dir(&link)
+                    .map(|mut d| d.next().is_some())
+                    .unwrap_or(true)
+            {
+                return Err(Error::msg(format!(
+                    "{} 已存在但不是链接，请手动处理后重试",
+                    link.display()
+                )));
+            }
+            std::fs::remove_dir(&link)?;
+        } else {
+            #[cfg(windows)]
+            std::fs::remove_dir(&link)?;
+            #[cfg(not(windows))]
+            std::fs::remove_file(&link)?;
+        }
+    }
+
+    // shim：删除 7 个工具名副本。bin/jvm.exe 是 CLI 本体，保留——
+    // `jvm` 命令仍可用，之后可随时重新 use。
+    let bin = home.bin();
+    for tool in SHIM_TOOLS {
+        let _ = std::fs::remove_file(bin.join(installer::exe_name(tool)));
+    }
+
+    store::remove_default(home)?;
+
+    #[cfg(windows)]
+    {
+        let is_ours = crate::env::windows::get_user_env("JAVA_HOME")
+            .map(|v| v.eq_ignore_ascii_case(&link.to_string_lossy()))
+            .unwrap_or(false);
+        if is_ours {
+            env.remove("JAVA_HOME")?;
+        }
+        env.remove_path_entry(&bin)?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = env;
+    }
+
+    tracing::info!("已取消默认 JDK（default/current/shim/环境变量已清理）");
+    Ok(true)
+}
+
 /// 重建 `current` 链接。
 ///
 /// Windows 用 junction（目录联接）而非符号链接：symlink 需要管理员权限
 /// 或开发者模式，junction 普通用户即可创建。
+///
+/// 遇到残留的普通目录时先尝试 [`heal_displaced_current`] 自愈：数据目录
+/// 被资源管理器跨盘移动时 junction 会被解引用成普通目录，直接报错会把
+/// 用户卡死在"设为默认失败"，且坏状态永不自清。
 pub fn rebuild_current_link(home: &Home, target: &std::path::Path) -> Result<()> {
     let link = home.current();
     #[cfg(windows)]
@@ -119,33 +189,79 @@ pub fn rebuild_current_link(home: &Home, target: &std::path::Path) -> Result<()>
         // false，会让重建被误拒。std 对 junction 的 symlink_metadata 报告
         // is_symlink == true，悬空时依然成立。
         if let Ok(meta) = link.symlink_metadata() {
-            if !meta.file_type().is_symlink() {
-                return Err(Error::msg(format!(
-                    "{} 已存在但不是 junction，请手动处理后重试",
-                    link.display()
-                )));
+            if meta.file_type().is_symlink() {
+                // remove_dir 只删除联接本身，不会递归删除目标内容。
+                std::fs::remove_dir(&link)?;
+            } else {
+                heal_displaced_current(&link, target)?;
             }
-            // remove_dir 只删除联接本身，不会递归删除目标内容。
-            std::fs::remove_dir(&link)?;
         }
         junction::create(target, &link)?;
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileTypeExt;
-        let meta = link.symlink_metadata();
-        if let Ok(m) = meta {
-            if !m.file_type().is_symlink() {
-                return Err(Error::msg(format!(
-                    "{} 已存在但不是符号链接，请手动处理后重试",
-                    link.display()
-                )));
+        if let Ok(m) = link.symlink_metadata() {
+            if m.file_type().is_symlink() {
+                std::fs::remove_file(&link)?;
+            } else {
+                heal_displaced_current(&link, target)?;
             }
-            std::fs::remove_file(&link)?;
         }
         std::os::unix::fs::symlink(target, &link)?;
     }
     Ok(())
+}
+
+/// `current` 位置残留了非链接条目时的自愈（[`rebuild_current_link`] 内用）。
+///
+/// 两种可安全自愈的形态：
+/// - 空目录：直接删除，让链接重建；
+/// - 目录内容是一个完整 JDK（含 bin/java），而链接目标目录不存在或为空
+///   ——这正是"资源管理器搬移数据目录时 junction 被解引用"的特征：原
+///   目标内容被整体移进了 current。把内容改名归位到目标后重建链接，
+///   数据零丢失。
+///
+/// 其余形态（非目录、内容与目标版本对不上）保持报错，绝不递归删除，
+/// 避免误伤用户手工放置的文件。
+fn heal_displaced_current(link: &std::path::Path, target: &std::path::Path) -> Result<()> {
+    let not_healable = || {
+        Error::msg(format!(
+            "{} 已存在但不是链接，且内容无法自动归位，请手动处理后重试",
+            link.display()
+        ))
+    };
+    if !link.is_dir() {
+        return Err(not_healable());
+    }
+    let dir_empty = |p: &std::path::Path| {
+        std::fs::read_dir(p)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false)
+    };
+    if dir_empty(link) {
+        std::fs::remove_dir(link)?;
+        tracing::warn!(
+            dir = %link.display(),
+            "current 是残留的普通空目录（数据目录可能被外部移动过），已删除并重建链接"
+        );
+        return Ok(());
+    }
+    let looks_like_jdk = link.join("bin").join(installer::exe_name("java")).is_file();
+    let target_vacant = !target.exists() || (target.is_dir() && dir_empty(target));
+    if looks_like_jdk && target_vacant {
+        if target.is_dir() {
+            std::fs::remove_dir(target)?;
+        }
+        std::fs::rename(link, target)?;
+        tracing::warn!(
+            from = %link.display(),
+            to = %target.display(),
+            "current 的内容是链接目标的完整拷贝（junction 被外部移动解引用），已归位并重建链接"
+        );
+        return Ok(());
+    }
+    Err(not_healable())
 }
 
 /// 把当前可执行文件复制为 `bin/` 下的各命令 shim；CLI 本体（文件名 jvm）
@@ -285,7 +401,9 @@ mod tests {
         let java_shim = home.bin().join(exe_name("java"));
         assert!(java_shim.exists());
         let size_a = std::fs::metadata(&java_shim).unwrap().len();
-        let size_b = std::fs::metadata(std::env::current_exe().unwrap()).unwrap().len();
+        let size_b = std::fs::metadata(std::env::current_exe().unwrap())
+            .unwrap()
+            .len();
         assert_eq!(size_a, size_b);
     }
 
@@ -336,6 +454,58 @@ mod tests {
         let gui2 = d2.path().join("JVMDesktop.exe");
         std::fs::write(&gui2, b"gui").unwrap();
         assert_eq!(resolve_shim_source(&gui2), gui2);
+    }
+
+    #[test]
+    fn rebuild_heals_empty_residue_dir() {
+        let (_d, home) = tmp_home();
+        let target = home.versions().join("temurin_17.0.12_7");
+        std::fs::create_dir_all(&target).unwrap();
+        // current 被外部替换成了普通空目录：直接清掉重建
+        std::fs::create_dir(home.current()).unwrap();
+        rebuild_current_link(&home, &target).unwrap();
+        #[cfg(windows)]
+        assert!(junction::exists(home.current()).unwrap());
+        #[cfg(unix)]
+        assert!(std::fs::symlink_metadata(home.current())
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn rebuild_salvages_dereferenced_current() {
+        let (_d, home) = tmp_home();
+        let target = home.versions().join("temurin_17.0.12_7");
+        std::fs::create_dir_all(&target).unwrap();
+        // 解引用搬移特征：目标成了空壳，JDK 内容整体落在 current
+        let jdk_bin = home.current().join("bin");
+        std::fs::create_dir_all(&jdk_bin).unwrap();
+        std::fs::write(jdk_bin.join(exe_name("java")), b"x").unwrap();
+
+        rebuild_current_link(&home, &target).unwrap();
+        // 内容归位到目标，current 重建为链接
+        assert!(target.join("bin").join(exe_name("java")).is_file());
+        #[cfg(windows)]
+        assert!(junction::exists(home.current()).unwrap());
+        #[cfg(unix)]
+        assert!(std::fs::symlink_metadata(home.current())
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn rebuild_keeps_error_on_unrelated_residue() {
+        let (_d, home) = tmp_home();
+        let target = home.versions().join("temurin_17.0.12_7");
+        std::fs::create_dir_all(target.join("sub")).unwrap(); // 目标非空
+        let bin = home.current().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join(exe_name("java")), b"x").unwrap();
+        // 内容与目标对不上（目标非空）：保持报错，数据原样保留
+        assert!(rebuild_current_link(&home, &target).is_err());
+        assert!(bin.join(exe_name("java")).is_file());
     }
 
     #[test]

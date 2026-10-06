@@ -44,6 +44,7 @@ export const CONFIG_FALLBACK: AppConfig = {
   proxy: "",
   sourceApiKey: "",
   autoCleanDownload: false,
+  unbindDeletesJvmrc: false,
 };
 
 export const useAppStore = defineStore("app", {
@@ -246,6 +247,12 @@ export const useAppStore = defineStore("app", {
       ]);
     },
 
+    /** 从后端重拉设置（体检修复清空失效目录覆盖后同步输入框） */
+    async reloadConfig() {
+      this.config = await api.getConfig();
+      this.normalizeConfig();
+    },
+
     async refreshLocal() {
       try {
         this.localJdks = await api.getLocalJdks();
@@ -383,6 +390,17 @@ export const useAppStore = defineStore("app", {
         this.log("success", `已设为默认 JDK: ${dir}`);
       } catch (e) {
         this.log("error", `设为默认失败: ${e}`);
+        throw e;
+      }
+      await this.refreshLocal();
+    },
+
+    async unsetDefault() {
+      try {
+        await api.unsetDefault();
+        this.log("success", "已取消默认版本，java 回退到系统配置");
+      } catch (e) {
+        this.log("error", `取消默认失败: ${e}`);
         throw e;
       }
       await this.refreshLocal();

@@ -17,8 +17,21 @@ pub trait UserEnvWriter {
     fn set(&mut self, name: &str, value: &str) -> Result<()>;
     /// 向用户 PATH 追加目录（幂等）。
     fn append_path_entry(&mut self, dir: &Path) -> Result<()>;
-    /// 从用户 PATH 移除目录（不存在则不动；`.jdm` → `.jvm` 数据迁移用）。
+    /// 从用户 PATH 移除目录（不存在则不动；取消默认版本时清理 bin 目录用）。
     fn remove_path_entry(&mut self, dir: &Path) -> Result<()>;
+    /// 删除用户环境变量（取消默认时清 JAVA_HOME；不存在则不动）。
+    /// 默认无操作：仅 Windows 需要真实落盘，Unix 不自动改 rc。
+    fn remove(&mut self, name: &str) -> Result<()> {
+        let _ = name;
+        Ok(())
+    }
+    /// 清理用户 PATH 中的同义重复条目（`%VAR%` 展开后指向同一目录的
+    /// 只保留最先出现的一个），返回被移除的原始条目。默认无操作：
+    /// Unix 不自动改 rc 文件，PATH 由用户自己维护。
+    fn dedupe_path(&mut self) -> Result<Vec<String>> {
+        let _ = self;
+        Ok(Vec::new())
+    }
 }
 
 /// 无操作实现（Unix / 测试）。
@@ -56,7 +69,7 @@ pub mod windows {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use winreg::enums::{HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, RegType};
+    use winreg::enums::{RegType, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE};
     use winreg::{RegKey, RegValue};
 
     use super::UserEnvWriter;
@@ -86,13 +99,15 @@ pub mod windows {
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                let file = self
-                    .logs_dir
-                    .join(format!("env-backup-{name}-{ts}.txt"));
+                let file = self.logs_dir.join(format!("env-backup-{name}-{ts}.txt"));
                 let _ = std::fs::create_dir_all(&self.logs_dir);
                 let _ = std::fs::write(
                     file,
-                    format!("name={name}\ntype={:?}\nvalue={}\n", v.vtype, decode_utf16(&v.bytes)),
+                    format!(
+                        "name={name}\ntype={:?}\nvalue={}\n",
+                        v.vtype,
+                        decode_utf16(&v.bytes)
+                    ),
                 );
             }
         }
@@ -100,6 +115,26 @@ pub mod windows {
         fn unchanged(old: Option<&RegValue>, value: &str) -> bool {
             old.map(|v| decode_utf16(&v.bytes).eq_ignore_ascii_case(value))
                 .unwrap_or(false)
+        }
+
+        /// 按条目列表重建用户 PATH：保留原注册表类型（REG_EXPAND_SZ 里
+        /// 的 %...% 引用不能因改类型而失效），写前备份旧值，写后广播。
+        fn write_path(&self, old: Option<&RegValue>, entries: &[String]) -> Result<()> {
+            let vtype = old
+                .map(|v| v.vtype.clone())
+                .unwrap_or(RegType::REG_EXPAND_SZ);
+            let new_text = entries.join(";");
+            let bytes: Vec<u8> = new_text
+                .encode_utf16()
+                .chain(std::iter::once(0u16))
+                .flat_map(|u| u.to_le_bytes())
+                .collect();
+            let key = Self::env_key()?;
+            self.backup("Path", old);
+            key.set_raw_value("Path", &RegValue { vtype, bytes })
+                .map_err(|e| Error::msg(format!("写入用户 PATH 失败: {e}")))?;
+            broadcast_env_change();
+            Ok(())
         }
     }
 
@@ -121,33 +156,17 @@ pub mod windows {
         fn append_path_entry(&mut self, dir: &Path) -> Result<()> {
             let key = Self::env_key()?;
             let old = key.get_raw_value("Path").ok();
-            let (vtype, text) = match &old {
-                Some(v) => (v.vtype.clone(), decode_utf16(&v.bytes)),
-                None => (RegType::REG_EXPAND_SZ, String::new()),
+            let text = match &old {
+                Some(v) => decode_utf16(&v.bytes),
+                None => String::new(),
             };
             let dir_str = dir.to_string_lossy().to_string();
-            if path_entries(&text)
-                .iter()
-                .any(|e| e.eq_ignore_ascii_case(&dir_str))
-            {
+            let mut entries = path_entries(&text);
+            if entries.iter().any(|e| path_entry_matches(e, &dir_str)) {
                 return Ok(());
             }
-            self.backup("Path", old.as_ref());
-            let new_text = if text.trim().is_empty() {
-                dir_str
-            } else {
-                format!("{text};{dir_str}")
-            };
-            // 保留原注册表类型：用户 PATH 若为 REG_EXPAND_SZ，改成 REG_SZ
-            // 会使其中 %...% 引用不再展开。
-            let bytes: Vec<u8> = new_text
-                .encode_utf16()
-                .chain(std::iter::once(0u16))
-                .flat_map(|u| u.to_le_bytes())
-                .collect();
-            key.set_raw_value("Path", &RegValue { vtype, bytes })
-                .map_err(|e| Error::msg(format!("写入用户 PATH 失败: {e}")))?;
-            broadcast_env_change();
+            entries.push(dir_str);
+            self.write_path(old.as_ref(), &entries)?;
             tracing::info!(dir = %dir.display(), "已把 shim 目录加入用户 PATH");
             Ok(())
         }
@@ -158,29 +177,53 @@ pub mod windows {
             let Some(v) = old else {
                 return Ok(());
             };
-            let text = decode_utf16(&v.bytes);
-            let entries = path_entries(&text);
-            let want = dir.to_string_lossy().replace('/', "\\");
+            let entries = path_entries(&decode_utf16(&v.bytes));
+            let want = dir.to_string_lossy().to_string();
             let kept: Vec<String> = entries
                 .iter()
-                .filter(|e| !e.replace('/', "\\").eq_ignore_ascii_case(&want))
+                .filter(|e| !path_entry_matches(e, &want))
                 .cloned()
                 .collect();
             if kept.len() == entries.len() {
                 return Ok(());
             }
-            self.backup("Path", Some(&v));
-            let new_text = kept.join(";");
-            // 保留原注册表类型，理由同 append_path_entry。
-            let bytes: Vec<u8> = new_text
-                .encode_utf16()
-                .chain(std::iter::once(0u16))
-                .flat_map(|u| u.to_le_bytes())
-                .collect();
-            key.set_raw_value("Path", &RegValue { vtype: v.vtype, bytes })
-                .map_err(|e| Error::msg(format!("写入用户 PATH 失败: {e}")))?;
-            broadcast_env_change();
+            self.write_path(Some(&v), &kept)?;
             tracing::info!(dir = %dir.display(), "已从用户 PATH 移除目录");
+            Ok(())
+        }
+
+        fn dedupe_path(&mut self) -> Result<Vec<String>> {
+            let key = Self::env_key()?;
+            let old = key.get_raw_value("Path").ok();
+            let Some(v) = old else {
+                return Ok(Vec::new());
+            };
+            let entries = path_entries(&decode_utf16(&v.bytes));
+            let removed = duplicate_path_entries(&entries);
+            if removed.is_empty() {
+                return Ok(removed);
+            }
+            let kept: Vec<String> = entries
+                .iter()
+                .filter(|e| !removed.iter().any(|r| r == *e))
+                .cloned()
+                .collect();
+            self.write_path(Some(&v), &kept)?;
+            tracing::info!(count = removed.len(), "已去除用户 PATH 中的同义重复条目");
+            Ok(removed)
+        }
+
+        fn remove(&mut self, name: &str) -> Result<()> {
+            let key = Self::env_key()?;
+            let old = key.get_raw_value(name).ok();
+            let Some(v) = old else {
+                return Ok(());
+            };
+            self.backup(name, Some(&v));
+            key.delete_value(name)
+                .map_err(|e| Error::msg(format!("删除用户环境变量 {name} 失败: {e}")))?;
+            broadcast_env_change();
+            tracing::info!(name, "已删除用户环境变量");
             Ok(())
         }
     }
@@ -204,15 +247,62 @@ pub mod windows {
             .collect()
     }
 
+    /// 展开 PATH 条目里的 `%VAR%` 段（用户 PATH 常用变量形式，如
+    /// `%JVM_HOME%\bin`）；未知变量整段原样保留。比较前先展开，避免
+    /// 「变量条目 + 字面条目」指向同一目录却被判为不同而重复添加。
+    pub fn expand_path_entry(entry: &str) -> String {
+        let mut out = String::with_capacity(entry.len());
+        let mut rest = entry;
+        while let Some(i) = rest.find('%') {
+            let after = &rest[i + 1..];
+            match after.find('%') {
+                Some(j) => {
+                    out.push_str(&rest[..i]);
+                    match std::env::var(&after[..j]) {
+                        Ok(v) => out.push_str(&v),
+                        // 变量不存在时连百分号一起原样保留
+                        Err(_) => out.push_str(&rest[i..i + j + 2]),
+                    }
+                    rest = &after[j + 1..];
+                }
+                None => break,
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// PATH 条目与目标目录是否同义（先展开 %VAR% 再做分隔符/大小写无关比较）。
+    fn path_entry_matches(entry: &str, dir: &str) -> bool {
+        expand_path_entry(entry)
+            .replace('/', "\\")
+            .eq_ignore_ascii_case(dir.replace('/', "\\").as_str())
+    }
+
+    /// 找出 PATH 条目里的同义重复：`%VAR%` 展开后指向同一目录的条目视为
+    /// 重复（分隔符方向与大小写无关），保留最先出现者，返回后续重复项
+    /// 的原始文本。供体检检测与 [`UserEnvWriter::dedupe_path`] 共用。
+    pub fn duplicate_path_entries(entries: &[String]) -> Vec<String> {
+        let mut seen: Vec<String> = Vec::new();
+        let mut removed = Vec::new();
+        for e in entries {
+            let key = expand_path_entry(e).replace('/', "\\").to_ascii_lowercase();
+            if seen.contains(&key) {
+                removed.push(e.clone());
+            } else {
+                seen.push(key);
+            }
+        }
+        removed
+    }
+
     /// 广播环境变量变更。
     ///
     /// 用 SendNotifyMessage（异步）而非 SendMessage：不必等待所有窗口
     /// 应答，避免被无响应窗口阻塞。
     pub fn broadcast_env_change() {
         use windows_sys::Win32::Foundation::HWND;
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            SendNotifyMessageW, WM_SETTINGCHANGE,
-        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SendNotifyMessageW, WM_SETTINGCHANGE};
         // HWND_BROADCAST = 0xffff；windows-sys 不同版本句柄类型不同，
         // 用整型转换规避版本差异。
         let hwnd_broadcast: usize = 0xffff;
@@ -232,9 +322,7 @@ pub mod windows {
         let key = RegKey::predef(HKEY_CURRENT_USER)
             .open_subkey("Environment")
             .ok()?;
-        key.get_raw_value(name)
-            .ok()
-            .map(|v| decode_utf16(&v.bytes))
+        key.get_raw_value(name).ok().map(|v| decode_utf16(&v.bytes))
     }
 
     /// 用户 PATH 是否已包含某目录（不区分大小写与分隔符方向）。
@@ -242,10 +330,10 @@ pub mod windows {
         let Some(text) = get_user_env("Path") else {
             return false;
         };
-        let want = dir.to_string_lossy().replace('/', "\\");
+        let want = dir.to_string_lossy().to_string();
         path_entries(&text)
             .iter()
-            .any(|e| e.replace('/', "\\").eq_ignore_ascii_case(&want))
+            .any(|e| path_entry_matches(e, &want))
     }
 
     #[cfg(test)]
@@ -254,13 +342,49 @@ pub mod windows {
 
         #[test]
         fn decode_roundtrip() {
-            let text = "C:\\Users\\test;.jdm\\bin";
+            let text = "C:\\Users\\test;D:\\tools\\bin";
             let bytes: Vec<u8> = text
                 .encode_utf16()
                 .chain(std::iter::once(0u16))
                 .flat_map(|u| u.to_le_bytes())
                 .collect();
             assert_eq!(decode_utf16(&bytes), text);
+        }
+
+        #[test]
+        fn expands_path_entry_vars() {
+            std::env::set_var("JVM_TEST_HOME_X", "D:\\tools\\jvm");
+            assert_eq!(
+                expand_path_entry("%JVM_TEST_HOME_X%\\bin"),
+                "D:\\tools\\jvm\\bin"
+            );
+            assert_eq!(expand_path_entry("C:\\static"), "C:\\static");
+            // 未知变量与孤立百分号原样保留
+            assert_eq!(expand_path_entry("%NOPE_XYZ%\\bin"), "%NOPE_XYZ%\\bin");
+            assert_eq!(expand_path_entry("100%"), "100%");
+        }
+
+        #[test]
+        fn detects_duplicate_path_entries() {
+            std::env::set_var("JVM_TEST_HOME_X", "D:\\tools\\jvm");
+            let entries: Vec<String> = vec![
+                "%JVM_TEST_HOME_X%\\bin".into(),
+                "D:/tools/jvm/bin".into(),    // 同义：分隔符方向不同
+                "d:\\Tools\\JVM\\bin".into(), // 同义：大小写不同
+                "C:\\other".into(),
+            ];
+            // 同义条目保留最先出现者（变量形式优先），后续重复项原样返回
+            assert_eq!(
+                duplicate_path_entries(&entries),
+                vec![
+                    "D:/tools/jvm/bin".to_string(),
+                    "d:\\Tools\\JVM\\bin".to_string()
+                ]
+            );
+            assert_eq!(
+                duplicate_path_entries(&["C:\\a".to_string()]),
+                Vec::<String>::new()
+            );
         }
 
         #[test]

@@ -3,12 +3,14 @@
 //! 流程：
 //! 1. 入口先解析校验和（API 字段优先，其次 `.sha256.txt` 校验和文件），
 //!    来源不可得在下载开始前就能从日志看到，而不是数百 MB 下载完才发现；
-//! 2. HEAD / Range-0-0 探测总长度与 Range 支持；
+//! 2. HEAD / Range-0-0 探测总长度与 Range 支持（带响应头超时与重试，
+//!    两个探测全部失败才降级单流）；
 //! 3. 支持 Range 且文件较大时按 `concurrency` 分块，每块独立 Range 请求，
 //!    进度持久化到 `<dest>.part.json` 边车文件，重试/续传按块推进；
 //!    CDN/运营商常在连接存活一段时间后限速（表现为越下越慢直到每秒几十
-//!    KB），分块按滑动窗口测速，均速跌破自身峰值的 1/4 即断开重连换回
-//!    突发带宽；
+//!    KB），分块按滑动窗口测速，均速跌破自身峰值的 1/4（先快后慢）或
+//!    连续两个窗口低于绝对下限（从头就慢：晚间跨境拥塞下新连接可能一直
+//!    只有几十 KB/s，攒不出峰值参照）即断开重连换回突发带宽；
 //! 4. 完成后流式计算整文件 SHA-256 并比对，通过后才把 `.part` 原子改名
 //!    为最终文件——任何失败都不会产生半成品。
 //!
@@ -47,6 +49,14 @@ const RATE_WINDOW: Duration = Duration::from_secs(15);
 /// 门槛必须低于单块的典型峰值（如 1-2MB/s 线路 16 分块下单块峰值仅
 /// 60-125KB/s），定高了看门狗永远不触发，限速块会一路爬到底。
 const RATE_PEAK_MIN_BPS: u64 = 64 * 1024;
+/// 绝对速率下限（B/s）：连续两个测速窗口均速低于该值即弃用当前连接。
+/// 覆盖相对衰减规则的盲区——跨境拥塞时段新连接可能"从头就慢"（每个窗口
+/// 都只有几十 KB/s，攒不出峰值，衰减判定永远不触发），而实测同一线路换
+/// 一条连接常能拿回突发带宽（路由抽签），持续低速就该换线。取值权衡：
+/// 定高了会把"慢但稳定"的线路反复拆掉（重连有握手与慢启动代价，贫瘠
+/// 线路上换到的连接大概率同样慢），定低了换线迟钝；误判频率由重连冷却
+/// 兜底。
+const RATE_FLOOR_BPS: u64 = 96 * 1024;
 /// 限速重连的冷却时间：重连本身有代价（TCP 慢启动重来），同一块两次
 /// 重连至少间隔这么久。取值不能太大——部分下载源对"长连接"降速极狠
 /// （新连接能跑满、老连接掉到几 KB/s），轮换是唯一的续命手段。
@@ -59,9 +69,27 @@ const PERSIST_EVERY: u64 = 4 * 1024 * 1024;
 const MIN_CHUNKED_SIZE: u64 = 16 * 1024 * 1024;
 /// 每块最小 4MiB，避免小块过多。
 const MIN_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
-/// 单块连续无进展尝试的上限：任何收到数据的尝试都会清零计数，
-/// 限速重连因此不消耗预算（详见 [`run_chunk`] 文档）。
+/// 探测类请求（HEAD / Range 0-0 / 校验和文件）的尝试次数：拿到响应即算
+/// 成功——4xx/5xx 是有效答案，交调用方按状态码处理；仅网络错误与响应头
+/// 超时重试。
+const PROBE_ATTEMPTS: u32 = 3;
+/// 探测重试的固定间隔：探测请求极轻，固定 1s 足以避开瞬时抖动，不值得
+/// 像分块重试那样指数增长。
+const PROBE_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// 单块连续无进展尝试的上限：「无进展」指收到的字节不足
+/// [`MIN_PROGRESS_BYTES`]（限速重连每轮都带着远超该值的进展，不消耗
+/// 预算，详见 [`run_chunk`] 文档）。
 const MAX_ATTEMPTS: u32 = 5;
+/// 一轮尝试视为「有效进展」的最少收字节：达到即清零连续失败计数。
+/// 门槛取 64KiB——对 4MiB 起步的分块毫无意义，却足以区分「真的在传」
+/// 与「垂死连接每次漏几十字节」：后者靠 1 字节进展就能把重试循环永续。
+const MIN_PROGRESS_BYTES: u64 = 64 * 1024;
+/// 重试退避步长与封顶：随连续硬失败翻倍（1s→2s→4s→8s）。立即重试在
+/// 限流（429）场景是重试风暴——四个分块几乎同时被限又同时重打；对流
+/// 中断的重试，退避也能错开持续抖动的窗口。限速重连不走此路径（它有
+/// 自己的冷却时钟 [`RECONNECT_COOLDOWN`]）。
+const RETRY_BACKOFF_STEP: Duration = Duration::from_secs(1);
+const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(8);
 /// 下载断点（*.part / *.part.json）的保留时长：取消/失败保留断点用于续传，
 /// 超过此时长仍未重试即视为垃圾，由 [`clean_stale_parts`] 回收。
 pub const STALE_PART_TTL: Duration = Duration::from_secs(12 * 3600);
@@ -84,16 +112,32 @@ pub struct DownloadTask {
     pub cancel: Option<Arc<AtomicBool>>,
 }
 
-/// 限速看门狗：滑动窗口均速 vs 本块历史峰值，判定连接是否被限速。
+/// 看门狗建议弃用当前连接的原因（`bps` 为触发窗口的实测均速）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RateVerdict {
+    /// 相对衰减：均速跌破历史峰值的 1/4（先快后慢的长连接限速）。
+    Decay { bps: u64, peak_bps: u64 },
+    /// 绝对下限：连续两个窗口均速低于 [`RATE_FLOOR_BPS`]（从头就慢的
+    /// 连接，没有峰值可参照）。
+    Floor { bps: u64 },
+}
+
+/// 限速看门狗：滑动窗口测速，两条规则判定连接应当弃用。
 ///
 /// CDN/运营商对存活一段时间的长连接限速，表现为"越下越慢"——连接仍在
 /// 滴数据，停滞超时与流错误都不会触发，唯有主动断开重连（按断点续传）
-/// 才能换回新连接的突发带宽。判定用相对峰值而非绝对下限：线路本身慢时
-/// 均速≈峰值，重连毫无收益；只有"曾经快过、现在明显变慢"才是限速信号。
+/// 才能换回新连接的突发带宽。两条规则覆盖两类限速形态：
+/// - 相对衰减：均速跌破本块历史峰值的 1/4，"曾经快过、现在明显变慢"。
+///   线路本身慢时均速≈峰值，不会误伤；
+/// - 绝对下限：连续两个窗口低于 [`RATE_FLOOR_BPS`]。跨境拥塞时段新连接
+///   可能"从头就慢"（每窗口只有几十 KB/s，攒不出峰值），换连接是拿回
+///   突发带宽的唯一手段。
 struct RateWatchdog {
     window_start: Instant,
     window_bytes: u64,
     peak_bps: u64,
+    /// 连续低于绝对下限的窗口数；出现及格窗口即清零。
+    slow_windows: u32,
 }
 
 impl RateWatchdog {
@@ -102,13 +146,14 @@ impl RateWatchdog {
             window_start: Instant::now(),
             window_bytes: 0,
             peak_bps: 0,
+            slow_windows: 0,
         }
     }
 
-    /// 累计一次收到的字节；到窗口边界时判定。返回 `Some(当前速率)` 表示
-    /// 均速已跌破峰值的 1/4（且峰值达到门槛），建议断开重连——调用方可
-    /// 依据冷却/上限否决，否决后调用 [`Self::reset_window`] 继续用当前连接。
-    fn on_bytes(&mut self, n: u64, now: Instant) -> Option<u64> {
+    /// 累计一次收到的字节；到窗口边界时判定。返回 `Some(原因)` 表示建议
+    /// 断开重连——调用方可依据冷却/剩余量否决，否决后调用
+    /// [`Self::reset_window`] 继续用当前连接。
+    fn on_bytes(&mut self, n: u64, now: Instant) -> Option<RateVerdict> {
         self.window_bytes += n;
         let elapsed = now.duration_since(self.window_start);
         if elapsed < RATE_WINDOW {
@@ -119,14 +164,26 @@ impl RateWatchdog {
             self.peak_bps = bps;
         }
         if self.peak_bps >= RATE_PEAK_MIN_BPS && bps * 4 < self.peak_bps {
-            return Some(bps);
+            return Some(RateVerdict::Decay {
+                bps,
+                peak_bps: self.peak_bps,
+            });
+        }
+        if bps < RATE_FLOOR_BPS {
+            self.slow_windows += 1;
+            if self.slow_windows >= 2 {
+                return Some(RateVerdict::Floor { bps });
+            }
+        } else {
+            self.slow_windows = 0;
         }
         self.window_bytes = 0;
         self.window_start = now;
         None
     }
 
-    /// 丢弃当前窗口的累计（峰值保留），从现在起重新计时。
+    /// 丢弃当前窗口的累计（峰值与慢窗口计数保留——否决只是暂缓换线，
+    /// 连接并未恢复，慢窗口 streak 仍有效），从现在起重新计时。
     fn reset_window(&mut self, now: Instant) {
         self.window_bytes = 0;
         self.window_start = now;
@@ -135,7 +192,9 @@ impl RateWatchdog {
 
 impl DownloadTask {
     fn cancelled(&self) -> bool {
-        self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed))
+        self.cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed))
     }
 }
 
@@ -201,6 +260,9 @@ pub async fn download(task: DownloadTask, progress: Option<Arc<ProgressFn>>) -> 
     let started = std::time::Instant::now();
     // 下载前先确定校验和：字段缺失时先取几 KB 的校验和文件，让"来源不可得"
     // 在开头就暴露，而不是数百 MB 下完之后才失败。
+    if task.cancelled() {
+        return Err(Error::Cancelled);
+    }
     let expected = resolve_expected(&task).await;
     if expected.is_none() {
         tracing::warn!(
@@ -253,6 +315,11 @@ pub async fn download(task: DownloadTask, progress: Option<Arc<ProgressFn>>) -> 
     let sidecar_path = sidecar_path(&task.dest_file);
 
     let (total, ranges_ok, etag) = probe_source(&task).await.unwrap_or((0, false, None));
+    // 校验和与探测都可能耗时（含重试），返回后核对取消，避免为已取消的
+    // 任务预分配文件与建立分块。
+    if task.cancelled() {
+        return Err(Error::Cancelled);
+    }
 
     let existing = if sidecar_path.exists() && part.exists() {
         load_sidecar(&sidecar_path)
@@ -414,8 +481,13 @@ pub async fn download(task: DownloadTask, progress: Option<Arc<ProgressFn>>) -> 
     if task.dest_file.exists() {
         std::fs::remove_file(&task.dest_file)?;
     }
-    std::fs::rename(&part, &task.dest_file)
-        .map_err(|e| Error::msg(format!("落位 {} → {} 失败: {e}", part.display(), task.dest_file.display())))?;
+    std::fs::rename(&part, &task.dest_file).map_err(|e| {
+        Error::msg(format!(
+            "落位 {} → {} 失败: {e}",
+            part.display(),
+            task.dest_file.display()
+        ))
+    })?;
     std::fs::remove_file(&sidecar_path).ok();
     tracing::info!(
         url = %task.url,
@@ -430,9 +502,10 @@ pub async fn download(task: DownloadTask, progress: Option<Arc<ProgressFn>>) -> 
 
 /// 执行单个分块：断点续传 + 停滞重试 + 低速重连 + 取消检查。
 ///
-/// 重试预算只计「连续无进展失败」：任何一次尝试只要收到过数据就把计数
-/// 清零。限速重连（看门狗）每次都带着进展，不消耗预算——一次长下载可能
-/// 重连十几轮，若沿用总次数上限会在中途误报失败。
+/// 重试预算只计「连续无进展失败」：一次尝试收到的字节达到
+/// [`MIN_PROGRESS_BYTES`] 才把计数清零。限速重连（看门狗）每轮至少带
+/// 一个测速窗口（15s）的数据，常态远超门槛，不消耗预算——一次长下载
+/// 可能重连十几轮，若沿用总次数上限会在中途误报失败。
 async fn run_chunk(
     client: &reqwest::Client,
     url: &str,
@@ -440,8 +513,7 @@ async fn run_chunk(
     idx: usize,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<()> {
-    let is_cancelled =
-        || cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
+    let is_cancelled = || cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
     let mut hard_failures = 0u32;
     // 限速重连的冷却锚点（跨尝试保留）：重连只在"深衰减 + 冷却到期 +
     // 剩余量足够"时发生，频率由冷却时间自然限制，不需要硬上限。
@@ -504,7 +576,8 @@ async fn run_chunk(
                 if hard_failures >= MAX_ATTEMPTS {
                     break;
                 }
-                continue; // 网络抖动：重试
+                tokio::time::sleep(retry_backoff(hard_failures)).await;
+                continue; // 网络抖动：退避后重试
             }
             // 等响应头超时：服务器收了连接不吐数据。按可重试失败处理，
             // 否则任务会永久挂起——进度不动、取消也无响应。
@@ -520,6 +593,7 @@ async fn run_chunk(
                 if hard_failures >= MAX_ATTEMPTS {
                     break;
                 }
+                tokio::time::sleep(retry_backoff(hard_failures)).await;
                 continue;
             }
         };
@@ -542,6 +616,8 @@ async fn run_chunk(
             if hard_failures >= MAX_ATTEMPTS {
                 break;
             }
+            // 429/5xx：退避后重试，避免与其它分块同步重打形成风暴。
+            tokio::time::sleep(retry_backoff(hard_failures)).await;
             continue;
         }
 
@@ -597,20 +673,27 @@ async fn run_chunk(
                         shared.persist();
                         since_persist = 0;
                     }
-                    // 低速看门狗：窗口均速跌破峰值 1/4 才建议重连，且受
-                    // 冷却与剩余量约束。
+                    // 低速看门狗：先快后慢（相对衰减）或从头就慢（连续
+                    // 两窗口低于绝对下限）都建议换线，受冷却与剩余量约束。
                     if !unknown_total {
-                        if let Some(bps) = watchdog.on_bytes(n, Instant::now()) {
-                            let cooled = last_reconnect
-                                .map_or(true, |t| t.elapsed() >= RECONNECT_COOLDOWN);
+                        if let Some(verdict) = watchdog.on_bytes(n, Instant::now()) {
+                            let cooled =
+                                last_reconnect.is_none_or(|t| t.elapsed() >= RECONNECT_COOLDOWN);
                             if cooled && remaining > MIN_RECONNECT_REMAINING {
                                 last_reconnect = Some(Instant::now());
-                                tracing::info!(
-                                    chunk = idx,
-                                    rate_kb = bps / 1024,
-                                    peak_kb = watchdog.peak_bps / 1024,
-                                    "分块疑似被限速，断开重连（按断点续传）"
-                                );
+                                match verdict {
+                                    RateVerdict::Decay { bps, peak_bps } => tracing::info!(
+                                        chunk = idx,
+                                        rate_kb = bps / 1024,
+                                        peak_kb = peak_bps / 1024,
+                                        "分块疑似被限速（先快后慢），断开重连（按断点续传）"
+                                    ),
+                                    RateVerdict::Floor { bps } => tracing::info!(
+                                        chunk = idx,
+                                        rate_kb = bps / 1024,
+                                        "分块疑似被限速（持续低速），断开重连（按断点续传）"
+                                    ),
+                                }
                                 shared.persist();
                                 break;
                             }
@@ -635,14 +718,18 @@ async fn run_chunk(
             shared.persist();
             return Ok(());
         }
-        // 有进展（含限速重连）则连续失败计数清零；一无所获才算一次硬失败。
-        if attempt_bytes > 0 {
+        // 有足量进展（含限速重连——每轮重连至少带一个测速窗口的数据，
+        // 常态远超门槛）则连续失败计数清零；不足 MIN_PROGRESS_BYTES 视同
+        // 无进展：计一次硬失败并退避。「每次漏几十字节」的垂死源不再能
+        // 靠 1 字节进展把重试循环永续下去。
+        if attempt_bytes >= MIN_PROGRESS_BYTES {
             hard_failures = 0;
         } else {
             hard_failures += 1;
             if hard_failures >= MAX_ATTEMPTS {
                 break;
             }
+            tokio::time::sleep(retry_backoff(hard_failures)).await;
         }
         // 流提前结束：按断点重试补齐。
     }
@@ -677,13 +764,62 @@ fn plan_chunks(total: u64, concurrency: usize, ranges_ok: bool) -> Vec<ChunkStat
         } else {
             start + per - 1
         };
-        chunks.push(ChunkState { start, end, done: 0 });
+        chunks.push(ChunkState {
+            start,
+            end,
+            done: 0,
+        });
         start = end + 1;
     }
     chunks
 }
 
+/// 第 `n` 次连续硬失败后的退避时长：1s、2s、4s，之后封顶 8s。
+fn retry_backoff(hard_failures: u32) -> Duration {
+    let shift = hard_failures.saturating_sub(1).min(3);
+    (RETRY_BACKOFF_STEP * (1u32 << shift)).min(RETRY_BACKOFF_MAX)
+}
+
+/// 探测类请求的统一发送：响应头超时 + 固定间隔重试。
+///
+/// 分块请求有 [`RESPONSE_TIMEOUT`] 兜底「收下连接不吐响应头」的半死
+/// 连接，探测请求此前是裸 `send()`——一旦挂起，整个下载卡在开头且取消
+/// 无效（取消监视器要到分块启动后才运行）；且探测是只此一次的判定，
+/// 一次网络抖动就会把整个下载静默降级为单流无续传。这里补上超时与
+/// 重试，把瞬时抖动挡在降级之前。拿到响应（含 4xx/5xx）即算成功——
+/// 那是有意义的答案，交调用方按状态码处理。
+async fn send_probed(
+    build_req: impl Fn() -> reqwest::RequestBuilder,
+    cancelled: impl Fn() -> bool,
+    what: &str,
+) -> Option<reqwest::Response> {
+    for attempt in 1..=PROBE_ATTEMPTS {
+        if cancelled() {
+            return None;
+        }
+        if attempt > 1 {
+            tokio::time::sleep(PROBE_RETRY_DELAY).await;
+        }
+        match tokio::time::timeout(RESPONSE_TIMEOUT, build_req().send()).await {
+            Ok(Ok(resp)) => return Some(resp),
+            Ok(Err(e)) => {
+                tracing::warn!(probe = what, attempt, error = %e, "探测请求失败");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    probe = what,
+                    attempt,
+                    timeout_s = RESPONSE_TIMEOUT.as_secs(),
+                    "探测请求等待响应头超时"
+                );
+            }
+        }
+    }
+    None
+}
+
 /// 探测总长与 Range 支持：先 HEAD，被拒（403/405 等）退化为 Range 0-0。
+/// 两个探测各自带响应头超时与重试（[`send_probed`]）。
 async fn probe_source(task: &DownloadTask) -> Option<(u64, bool, Option<String>)> {
     // 注意：hyper 客户端对 HEAD 响应的 resp.content_length() 恒为 0
     // （报告的是 body 长度），必须直接读 Content-Length 头。
@@ -694,7 +830,8 @@ async fn probe_source(task: &DownloadTask) -> Option<(u64, bool, Option<String>)
             .and_then(|v| v.trim().parse::<u64>().ok())
     }
 
-    if let Ok(resp) = task.client.head(&task.url).send().await {
+    let cancelled = || task.cancelled();
+    if let Some(resp) = send_probed(|| task.client.head(&task.url), cancelled, "head").await {
         if resp.status().is_success() {
             let ranges = resp
                 .headers()
@@ -710,13 +847,16 @@ async fn probe_source(task: &DownloadTask) -> Option<(u64, bool, Option<String>)
     }
 
     // Range 0-0 探测：206 + Content-Range: bytes 0-0/<total>
-    let resp = task
-        .client
-        .get(&task.url)
-        .header(reqwest::header::RANGE, "bytes=0-0")
-        .send()
-        .await
-        .ok()?;
+    let resp = send_probed(
+        || {
+            task.client
+                .get(&task.url)
+                .header(reqwest::header::RANGE, "bytes=0-0")
+        },
+        cancelled,
+        "range0-0",
+    )
+    .await?;
     if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
         let cr = resp
             .headers()
@@ -840,8 +980,15 @@ pub fn parse_checksum_text(text: &str) -> Option<String> {
 }
 
 async fn fetch_checksum_hex(client: &reqwest::Client, url: &str) -> Result<Option<String>> {
-    let resp = client.get(url).send().await?.error_for_status()?;
-    let text = resp.text().await?;
+    let resp = match send_probed(|| client.get(url), || false, "checksum").await {
+        Some(r) => r,
+        None => return Err(Error::msg("校验和文件请求失败（含重试）")),
+    };
+    let resp = resp.error_for_status()?;
+    // 响应体同样可能停滞：校验和文件只有几 KB，套响应头超时足够。
+    let text = tokio::time::timeout(RESPONSE_TIMEOUT, resp.text())
+        .await
+        .map_err(|_| Error::msg("读取校验和文件超时"))??;
     Ok(parse_checksum_text(&text))
 }
 
@@ -877,7 +1024,7 @@ mod tests {
     use super::*;
 
     /// 把 N KB 喂给一个窗口并推进到窗口末尾，模拟一段时间内的传输。
-    fn feed(w: &mut RateWatchdog, t0: Instant, window: usize, kb: u64) -> Option<u64> {
+    fn feed(w: &mut RateWatchdog, t0: Instant, window: usize, kb: u64) -> Option<RateVerdict> {
         w.on_bytes(kb * 1024, t0 + RATE_WINDOW * window as u32)
     }
 
@@ -892,12 +1039,46 @@ mod tests {
     }
 
     #[test]
-    fn watchdog_ignores_slow_line_without_decay() {
+    fn watchdog_floor_triggers_on_slow_from_start() {
         let mut w = RateWatchdog::new();
         let t0 = Instant::now();
-        // 两个窗口均 ~96KiB/s：无衰减（均速≈峰值），线路本身慢，不重连。
+        // 晚间拥塞下的典型形态：连接从头就慢（~34KiB/s），每窗口都攒不出
+        // 峰值，衰减判定永不触发；连续两个慢窗口后按绝对下限换线。
+        assert_eq!(feed(&mut w, t0, 1, 512), None);
+        assert!(matches!(
+            feed(&mut w, t0, 2, 512),
+            Some(RateVerdict::Floor { .. })
+        ));
+    }
+
+    #[test]
+    fn watchdog_floor_needs_consecutive_slow_windows() {
+        let mut w = RateWatchdog::new();
+        let t0 = Instant::now();
+        // 慢（~64KiB/s）与及格（~110KiB/s）交替：单次慢窗口可能只是抖动，
+        // 不触发；及格窗口把连续计数清零。
         assert_eq!(feed(&mut w, t0, 1, 960), None);
-        assert_eq!(feed(&mut w, t0, 2, 960), None);
+        assert_eq!(feed(&mut w, t0, 2, 1650), None);
+        assert_eq!(feed(&mut w, t0, 3, 960), None);
+        assert_eq!(feed(&mut w, t0, 4, 1650), None);
+    }
+
+    #[test]
+    fn watchdog_floor_survives_veto_reset() {
+        let mut w = RateWatchdog::new();
+        let t0 = Instant::now();
+        // 触发后被调用方否决（冷却中）：重置窗口但保留慢窗口计数——连接
+        // 并未恢复，下个慢窗口应立即再次建议换线（受冷却实际约束频率）。
+        assert_eq!(feed(&mut w, t0, 1, 512), None);
+        assert!(matches!(
+            feed(&mut w, t0, 2, 512),
+            Some(RateVerdict::Floor { .. })
+        ));
+        w.reset_window(t0 + RATE_WINDOW * 2);
+        assert!(matches!(
+            feed(&mut w, t0, 3, 512),
+            Some(RateVerdict::Floor { .. })
+        ));
     }
 
     #[test]
@@ -961,6 +1142,15 @@ mod tests {
     }
 
     #[test]
+    fn retry_backoff_doubles_then_caps() {
+        assert_eq!(retry_backoff(1), Duration::from_secs(1));
+        assert_eq!(retry_backoff(2), Duration::from_secs(2));
+        assert_eq!(retry_backoff(3), Duration::from_secs(4));
+        assert_eq!(retry_backoff(4), Duration::from_secs(8));
+        assert_eq!(retry_backoff(9), Duration::from_secs(8), "封顶");
+    }
+
+    #[test]
     fn sha256_of_small_file() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("f.bin");
@@ -978,8 +1168,16 @@ mod tests {
             total: 100,
             etag: Some("\"abc\"".into()),
             chunks: vec![
-                ChunkState { start: 0, end: 49, done: 10 },
-                ChunkState { start: 50, end: 99, done: 0 },
+                ChunkState {
+                    start: 0,
+                    end: 49,
+                    done: 10,
+                },
+                ChunkState {
+                    start: 50,
+                    end: 99,
+                    done: 0,
+                },
             ],
         };
         let p = dir.path().join("sc.json");
@@ -1000,7 +1198,8 @@ mod tests {
         std::fs::write(&recent_part, b"x").unwrap();
 
         // 把 old 的修改时间拨到 TTL 之外
-        let past = std::time::SystemTime::now() - STALE_PART_TTL - std::time::Duration::from_secs(3600);
+        let past =
+            std::time::SystemTime::now() - STALE_PART_TTL - std::time::Duration::from_secs(3600);
         for p in [&old_part, &old_sidecar] {
             std::fs::OpenOptions::new()
                 .write(true)

@@ -12,7 +12,7 @@ const supportType = ref("");
 
 // 标记已安装：按索引记录 id（vendor@version）与包 id 匹配。
 // CLI 与 GUI 的安装目录名策略一致（都是 vendor@version），但匹配仍按
-// 索引 id——目录名只是展示值，外部导入的目录名可以是任意的。
+// 索引 id——目录名只是展示值。
 const installedIds = computed(
   () =>
     new Set(
@@ -200,6 +200,7 @@ function vendorName(r: ReleaseInfo): string {
           <td class="actions">
             <template v-if="progressOf(r)">
               <span v-if="progressOf(r)!.stage === 'download'" class="dl-row">
+                <span class="dl-label">{{ t("available.downloading") }}</span>
                 <span class="progress-track">
                   <span
                     class="progress-fill"
@@ -207,8 +208,8 @@ function vendorName(r: ReleaseInfo): string {
                   />
                 </span>
                 <span class="dl-text">
-                  {{ t("available.downloading") }} {{ progressOf(r)!.percent.toFixed(0) }}%
-                  <span v-if="progressOf(r)!.speed" class="muted">
+                  <span class="dl-percent">{{ progressOf(r)!.percent.toFixed(0) }}%</span>
+                  <span v-if="progressOf(r)!.speed" class="dl-speed muted">
                     · {{ formatSize(progressOf(r)!.speed ?? 0) }}/s
                   </span>
                 </span>
@@ -216,10 +217,10 @@ function vendorName(r: ReleaseInfo): string {
                   {{ t("common.cancel") }}
                 </button>
               </span>
-              <span v-else-if="progressOf(r)!.stage === 'prepare'">
+              <span v-else-if="progressOf(r)!.stage === 'prepare'" class="loading-row">
                 <span class="spin" /> {{ t("available.preparing") }}
               </span>
-              <span v-else-if="progressOf(r)!.stage === 'extract'">
+              <span v-else-if="progressOf(r)!.stage === 'extract'" class="loading-row">
                 <span class="spin" /> {{ t("available.extracting") }}
               </span>
               <span v-else-if="progressOf(r)!.stage === 'done'" class="done">
@@ -287,12 +288,18 @@ function vendorName(r: ReleaseInfo): string {
    的内容宽度，导致整表列宽重排（即「抖动」）；锁定后阶段切换、
    百分比/速度变化只在列内消化，其它列纹丝不动 */
 .actions {
-  width: 260px;
+  width: 264px;
 }
 
 /* 行高恒定：空闲(两个按钮)与下载中(进度行)强制等高并统一垂直居中。
    两者都是 inline 盒但基线规则不同——按钮取文字基线，inline-flex 取
    首个子元素的基线，切换瞬间行盒高度差几像素就是「抖一下」的根源 */
+/* 准备中/解压中一行：动画与文字的间隔（垂直居中由 .actions > * 的
+   align-items: center 提供） */
+.loading-row {
+  gap: 6px;
+}
+
 /* 下载中一行：进度条弹性填充操作列剩余宽度；display/align 由
    .actions > * 统一提供，这里只补进度行内部的子元素间距 */
 .dl-row {
@@ -307,9 +314,25 @@ function vendorName(r: ReleaseInfo): string {
   margin-right: 0;
 }
 
-.dl-text {
+/* 「下载中」标签：进度条前，宽度天然恒定 */
+.dl-label {
   white-space: nowrap;
   font-size: 12px;
+}
+
+/* 百分比+速度段在进度条之后：速度段用自然宽度（永远紧贴前后元素，
+   不留空隙）；百分比段固定 26px 吸收 "9%→100%" 的位数变化，速度起点
+   因此固定。位数变化带来的整体宽度增减由弹性进度条吸收，取消按钮
+   作为行尾元素位置恒定 */
+.dl-text {
+  display: inline-flex;
+  gap: 4px;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.dl-percent {
+  width: 26px;
 }
 
 .page-header {

@@ -110,7 +110,6 @@ mod tests {
         assert!(is_shim_tool("java"));
         assert!(is_shim_tool("JAVA"));
         assert!(is_shim_tool("jshell"));
-        assert!(!is_shim_tool("jdm"));
         assert!(!is_shim_tool("jvm"));
         assert!(!is_shim_tool("mvn"));
     }
@@ -133,8 +132,6 @@ mod tests {
             lts: true,
             dir: id.to_dir_name(),
             java_version_output: String::new(),
-            imported: false,
-            external: false,
             installed_at: "t".into(),
         });
         store::save_index(&home, &index).unwrap();

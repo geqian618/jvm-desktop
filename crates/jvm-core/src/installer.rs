@@ -249,77 +249,6 @@ fn jdk_home_moved(jdk_home: &Path, old_root: &Path, new_root: &Path) -> PathBuf 
     }
 }
 
-/// 导入本地已有 JDK：拷贝进 versions/（卸载语义统一为删除目录，
-/// 原地登记会导致卸载误删用户原始目录，故 v1 采用拷贝）。
-pub fn import_directory(
-    src: &Path,
-    id: &JdkId,
-    home: &Home,
-    verify: &Verifier,
-) -> Result<InstallOutcome> {
-    tracing::info!(src = %src.display(), id = %id, "开始导入本地 JDK");
-    let dir_name = id.to_dir_name();
-    let versions = home.versions();
-    std::fs::create_dir_all(&versions)?;
-    let dest = versions.join(&dir_name);
-    if dest.exists() {
-        return Err(Error::AlreadyInstalled(id.to_string()));
-    }
-    if !src.is_dir() {
-        return Err(Error::msg(format!("{} 不是目录", src.display())));
-    }
-
-    // src 本身是 JDK home，或其唯一子目录是（用户常选到外层）。
-    let layout = if jdk_home_of(src).is_some() {
-        src.to_path_buf()
-    } else {
-        let children: Vec<PathBuf> = std::fs::read_dir(src)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect();
-        match children.first() {
-            Some(c) if children.len() == 1 && jdk_home_of(c).is_some() => c.clone(),
-            _ => return Err(Error::BadArchive),
-        }
-    };
-
-    let jdk_home_rel = jdk_home_of(&layout)
-        .and_then(|h| h.strip_prefix(&layout).ok().map(|r| r.to_path_buf()))
-        .unwrap_or_default();
-    copy_tree(&layout, &dest)?;
-    tracing::info!(dest = %dest.display(), "拷贝完成，开始验证");
-    let moved_home = dest.join(&jdk_home_rel);
-    match verify(&moved_home) {
-        Ok(output) => Ok(InstallOutcome {
-            dir_name,
-            jdk_home: moved_home,
-            java_version_output: output,
-        }),
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&dest);
-            Err(e)
-        }
-    }
-}
-
-fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        let ty = entry.file_type()?;
-        if ty.is_dir() {
-            copy_tree(&from, &to)?;
-        } else if ty.is_file() {
-            std::fs::copy(&from, &to)?;
-        }
-        // 符号链接跳过（M1：导入含 symlink 的 JDK 属边缘场景）。
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,7 +270,8 @@ mod tests {
         let mut zip = zip::ZipWriter::new(file);
         let opts: zip::write::SimpleFileOptions = Default::default();
         zip.add_directory(format!("{root}/bin"), opts).unwrap();
-        zip.start_file(format!("{root}/bin/{}", exe_name("java")), opts).unwrap();
+        zip.start_file(format!("{root}/bin/{}", exe_name("java")), opts)
+            .unwrap();
         zip.write_all(b"fake java").unwrap();
         zip.start_file(format!("{root}/release"), opts).unwrap();
         zip.write_all(b"JAVA_VERSION=\"17.0.12\"").unwrap();
@@ -360,7 +290,10 @@ mod tests {
         let out = install_from_archive(&archive, &id, &home, &stub_verifier(true)).unwrap();
         assert_eq!(out.dir_name, "temurin@17.0.12+7");
         let dest = home.version_dir(&id);
-        assert!(dest.join("bin").join(exe_name("java")).is_file(), "根目录应被剥离");
+        assert!(
+            dest.join("bin").join(exe_name("java")).is_file(),
+            "根目录应被剥离"
+        );
         assert!(dest.join("release").is_file());
         assert!(out.java_version_output.contains("stub"));
         // 临时目录应清理
@@ -394,7 +327,12 @@ mod tests {
         zip.finish().unwrap();
         let id2 = JdkId::parse("temurin@18.0.1+9").unwrap();
         assert!(matches!(
-            install_from_archive(&tmp.path().join("empty.zip"), &id2, &home, &stub_verifier(true)),
+            install_from_archive(
+                &tmp.path().join("empty.zip"),
+                &id2,
+                &home,
+                &stub_verifier(true)
+            ),
             Err(Error::BadArchive)
         ));
     }
@@ -408,18 +346,27 @@ mod tests {
         // 手工打包 tar.gz：<root>/bin/java
         let src = tmp.path().join("payload");
         std::fs::create_dir_all(src.join("jdk-25.0.1+8/bin")).unwrap();
-        std::fs::write(src.join("jdk-25.0.1+8/bin").join(exe_name("java")), b"#!/bin/sh\n").unwrap();
+        std::fs::write(
+            src.join("jdk-25.0.1+8/bin").join(exe_name("java")),
+            b"#!/bin/sh\n",
+        )
+        .unwrap();
         let tar_gz = tmp.path().join("jdk.tar.gz");
         let f = std::fs::File::create(&tar_gz).unwrap();
         let enc = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
         let mut tb = tar::Builder::new(enc);
-        tb.append_dir_all("jdk-25.0.1+8", src.join("jdk-25.0.1+8")).unwrap();
+        tb.append_dir_all("jdk-25.0.1+8", src.join("jdk-25.0.1+8"))
+            .unwrap();
         tb.into_inner().unwrap().finish().unwrap();
 
         let id = JdkId::parse("zulu@25.0.1+8").unwrap();
         let out = install_from_archive(&tar_gz, &id, &home, &stub_verifier(true)).unwrap();
         assert_eq!(out.dir_name, "zulu@25.0.1+8");
-        assert!(home.version_dir(&id).join("bin").join(exe_name("java")).is_file());
+        assert!(home
+            .version_dir(&id)
+            .join("bin")
+            .join(exe_name("java"))
+            .is_file());
     }
 
     #[test]
@@ -430,22 +377,5 @@ mod tests {
         std::fs::write(dir.join("Contents/Home/bin").join(exe_name("java")), b"x").unwrap();
         let home = jdk_home_of(&dir).unwrap();
         assert!(home.ends_with("Contents/Home"));
-    }
-
-    #[test]
-    fn import_directory_copies_and_verifies() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = Home::from_root(tmp.path().join(".jvm"));
-        home.ensure_dirs().unwrap();
-        let src = tmp.path().join("my-jdk");
-        std::fs::create_dir_all(src.join("bin")).unwrap();
-        std::fs::write(src.join("bin").join(exe_name("java")), b"fake").unwrap();
-
-        let id = JdkId::parse("corretto@11.0.24+8").unwrap();
-        let out = import_directory(&src, &id, &home, &stub_verifier(true)).unwrap();
-        assert_eq!(out.dir_name, "corretto@11.0.24+8");
-        assert!(home.version_dir(&id).join("bin").join(exe_name("java")).is_file());
-        // 原目录保持不动
-        assert!(src.join("bin").join(exe_name("java")).is_file());
     }
 }

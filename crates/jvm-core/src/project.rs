@@ -61,8 +61,7 @@ pub fn resolve(start: &Path, home: &Home) -> Option<Resolution> {
                     };
                     let stale = chrono::DateTime::parse_from_rfc3339(&e.last_used_at)
                         .map(|t| {
-                            chrono::Utc::now().signed_duration_since(t)
-                                > chrono::Duration::hours(1)
+                            chrono::Utc::now().signed_duration_since(t) > chrono::Duration::hours(1)
                         })
                         .unwrap_or(true);
                     if stale {
@@ -79,7 +78,10 @@ pub fn resolve(start: &Path, home: &Home) -> Option<Resolution> {
     }
 
     // 3. 全局默认
-    store::read_default(home).ok().flatten().map(Resolution::Global)
+    store::read_default(home)
+        .ok()
+        .flatten()
+        .map(Resolution::Global)
 }
 
 /// 解析 `.jvmrc` 内容：取首个非空、非注释行的 `vendor@version`。

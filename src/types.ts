@@ -11,6 +11,22 @@ export interface PathDefaults {
   downloadDir: string;
 }
 
+/** 数据目录体检问题类别（对应 jvm-core::health::HealthCode） */
+export type HealthIssueCode =
+  | "current_broken"
+  | "default_target_missing"
+  | "stale_path_override"
+  | "java_home_stale"
+  | "path_entry_missing"
+  | "path_entry_duplicate";
+
+/** 体检发现的单个问题；fixable = 「一键修复」能否自动处理 */
+export interface HealthIssue {
+  code: HealthIssueCode;
+  message: string;
+  fixable: boolean;
+}
+
 export interface AppConfig {
   language: string;
   theme: string;
@@ -21,6 +37,8 @@ export interface AppConfig {
   proxy: string;
   sourceApiKey: string;
   autoCleanDownload: boolean;
+  /** 解除项目关联时同时删除项目目录里的 .jvmrc */
+  unbindDeletesJvmrc: boolean;
 }
 
 export interface DistributionInfo {
@@ -61,7 +79,6 @@ export interface LocalJdk {
   vendor: string | null;
   /** 安装日期（本地时区 YYYY-MM-DD，来自索引；未登记时为 null） */
   installedAt: string | null;
-  inInstallDir: boolean;
   isCurrent: boolean;
 }
 
