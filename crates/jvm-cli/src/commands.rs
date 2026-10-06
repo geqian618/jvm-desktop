@@ -107,7 +107,7 @@ pub async fn run(cmd: Cmd, home: &Home) -> Result<()> {
 pub(crate) enum ConfigCmd {
     /// 列出当前数据源与预设
     List,
-    /// 注册数据源到预设并切换到它
+    /// 注册数据源到预设（默认只入列不启用；--default 同时设为当前源）
     Registry {
         /// 数据源 URL（http/https，foojay Disco 兼容接口）
         #[arg(long)]
@@ -115,6 +115,9 @@ pub(crate) enum ConfigCmd {
         /// 数据源名称，如 内部镜像
         #[arg(long)]
         name: String,
+        /// 注册后同时设为当前数据源
+        #[arg(long)]
+        default: bool,
         /// 跳过可达性校验直接保存
         #[arg(long)]
         force: bool,
@@ -711,9 +714,12 @@ async fn config(home: &Home, cmd: Option<ConfigCmd>) -> Result<()> {
     let mut settings = store::load_settings(home)?;
     match cmd {
         None | Some(ConfigCmd::List) => registry_list(&settings),
-        Some(ConfigCmd::Registry { url, name, force }) => {
-            registry_add(&mut settings, home, url, name, force).await
-        }
+        Some(ConfigCmd::Registry {
+            url,
+            name,
+            default,
+            force,
+        }) => registry_add(&mut settings, home, url, name, default, force).await,
         Some(ConfigCmd::Use { target, force }) => {
             registry_use(&mut settings, home, target, force).await
         }
@@ -756,7 +762,7 @@ fn registry_list(settings: &Settings) -> Result<()> {
         println!(
             "\n切换: {}\n注册: {}\n编辑: {}\n删除: {}",
             ui::accent("jvm config use <名称|URL>"),
-            ui::accent("jvm config registry --url <URL> --name <名称>"),
+            ui::accent("jvm config registry --url <URL> --name <名称> [--default]"),
             ui::accent("jvm config edit <名称> [--name 新名] [--url 新URL]"),
             ui::accent("jvm config remove <名称>")
         );
@@ -764,13 +770,15 @@ fn registry_list(settings: &Settings) -> Result<()> {
     Ok(())
 }
 
-/// 注册数据源（对齐 GUI「添加数据源」：起名 → 校验 → 入列预设 → 启用）。
+/// 注册数据源（对齐 GUI「添加数据源」：起名 → 校验 → 入列预设）。
+/// 默认只入列不启用；`set_default` 时同时切换当前源。
 /// URL 不得与现有预设重复；自定义预设可被 remove 删除。
 async fn registry_add(
     settings: &mut Settings,
     home: &Home,
     url: String,
     name: String,
+    set_default: bool,
     force: bool,
 ) -> Result<()> {
     let name = name.trim();
@@ -809,18 +817,32 @@ async fn registry_add(
             }
         }
     }
+    // 默认只入列预设不动当前源；--default 时保留上面换上的新 URL
+    if !set_default {
+        settings.registry = saved_registry;
+    }
     settings.registry_presets.push(RegistryPreset {
         name: name.to_string(),
         url: url.to_string(),
         built_in: false,
     });
     store::save_settings(home, settings)?;
-    println!(
-        "已注册数据源并切换: {}（{}，API 规范 {}）",
-        ui::accent(name),
-        ui::accent(url),
-        ui::dim(source.spec_name())
-    );
+    if set_default {
+        println!(
+            "已注册数据源并设为当前: {}（{}，API 规范 {}）",
+            ui::accent(name),
+            ui::accent(url),
+            ui::dim(source.spec_name())
+        );
+    } else {
+        println!(
+            "已注册数据源: {}（{}，API 规范 {}）；启用: {}",
+            ui::accent(name),
+            ui::accent(url),
+            ui::dim(source.spec_name()),
+            ui::accent(format!("jvm config use {name}"))
+        );
+    }
     Ok(())
 }
 
@@ -849,7 +871,7 @@ async fn registry_use(
             }
         }
     };
-    if same_source(&url, &settings.registry.trim()) {
+    if same_source(&url, settings.registry.trim()) {
         println!(
             "已是当前数据源: {}",
             ui::accent(if url.is_empty() { FOOJAY_BASE } else { &url })
@@ -950,7 +972,7 @@ async fn registry_edit(
     }
 
     let url_changed = !same_source(&old_url, &new_url);
-    let was_current = same_source(&old_url, &settings.registry.trim());
+    let was_current = same_source(&old_url, settings.registry.trim());
     // URL 变更时先临时换上用于校验；非当前源的预设编辑完成后要还原。
     let saved_registry = std::mem::replace(&mut settings.registry, new_url.clone());
     let source = from_settings(settings)?;
@@ -1007,7 +1029,7 @@ fn registry_remove(settings: &mut Settings, home: &Home, name: String) -> Result
     }
     let removed = settings.registry_presets.remove(idx);
     let mut note = String::new();
-    if same_source(&removed.url, &settings.registry.trim()) {
+    if same_source(&removed.url, settings.registry.trim()) {
         settings.registry = String::new();
         note = "；它是当前数据源，已回退官方默认".to_string();
     }

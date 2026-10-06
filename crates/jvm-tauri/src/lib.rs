@@ -9,11 +9,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use jvm_core::model::{archive_filename, Release, RemotePackage};
-use jvm_core::source::{DistributionInfo, MajorVersion, from_settings};
+use jvm_core::source::{from_settings, DistributionInfo, MajorVersion};
 use jvm_core::store::{InstalledJdk, ProjectEntry, Settings};
 use jvm_core::{flow, scan, shim, store, switcher, Home};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 /// 元数据/包列表缓存 TTL。
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
@@ -24,6 +24,9 @@ struct AppState {
     meta_cache: Mutex<HashMap<String, (Instant, CachedMeta)>>,
     /// 安装/下载任务取消开关：key = taskId（即 release id）
     cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// GUI 最近一次读到的设置快照：save_config 据此判断期间是否有
+    /// CLI 等外部写入（磁盘内容 ≠ 快照 → 字段级合并写回）
+    last_settings: Mutex<Option<Settings>>,
 }
 
 struct CachedMeta {
@@ -169,21 +172,35 @@ struct PlatformDto {
 // ---------- 配置 ----------
 
 #[tauri::command]
-async fn get_config() -> Result<Settings, String> {
+async fn get_config(app: AppHandle) -> Result<Settings, String> {
     let home = app_home()?;
-    store::load_settings(&home).map_err(estr)
+    let settings = store::load_settings(&home).map_err(estr)?;
+    // 记录本次读取的快照：save_config 据此检测期间是否有外部（CLI）写入
+    let state = app.state::<SharedState>();
+    *state.last_settings.lock().unwrap() = Some(settings.clone());
+    Ok(settings)
 }
 
 #[tauri::command]
 async fn save_config(app: AppHandle, config: Settings) -> Result<(), String> {
     let home = app_home()?;
-    store::save_settings(&home, &config).map_err(estr)?;
+    let state = app.state::<SharedState>();
+    let last = state.last_settings.lock().unwrap().clone();
+    let disk = store::load_settings(&home).map_err(estr)?;
+    // 磁盘内容与 GUI 上次读取的快照不一致 → 期间有 CLI 等外部写入：
+    // 数据源字段以磁盘为准（CLI 的注册/切换不被陈旧快照抹掉），
+    // 其余字段以 GUI 为准；无并发写入时整体采用 GUI 对象。
+    let external_write = last.as_ref() != Some(&disk);
+    let merged = store::merge_settings(config, &disk, external_write);
+    store::save_settings(&home, &merged).map_err(estr)?;
+    *state.last_settings.lock().unwrap() = Some(merged.clone());
     // 关键变更记入文件日志便于排查（不记录 API Key 等敏感字段）。
     tracing::info!(
-        registry = %config.registry,
-        install_dir = %config.install_dir,
-        download_dir = %config.download_dir,
-        proxy_set = !config.proxy.trim().is_empty(),
+        registry = %merged.registry,
+        install_dir = %merged.install_dir,
+        download_dir = %merged.download_dir,
+        proxy_set = !merged.proxy.trim().is_empty(),
+        external_write,
         "设置已保存"
     );
     log_evt(&app, "success", "设置已保存");
@@ -344,7 +361,12 @@ async fn get_all_releases(
     let settings = store::load_settings(&home).map_err(estr)?;
     let key = format!(
         "{}|{}|{}|{}|{}|{}",
-        settings.registry, distribution, operating_system, architecture, archive_type, settings.proxy
+        settings.registry,
+        distribution,
+        operating_system,
+        architecture,
+        archive_type,
+        settings.proxy
     );
     if let Some((t, list)) = state.pkg_cache.lock().unwrap().get(&key) {
         if t.elapsed() < CACHE_TTL {
@@ -354,7 +376,12 @@ async fn get_all_releases(
     let start = Instant::now();
     let list = from_settings(&settings)
         .map_err(estr)?
-        .all_packages(&distribution, &operating_system, &architecture, &archive_type)
+        .all_packages(
+            &distribution,
+            &operating_system,
+            &architecture,
+            &archive_type,
+        )
         .await
         .map_err(estr)?;
     tracing::info!(vendor = %distribution, n = list.len(), elapsed = ?start.elapsed(), "已加载发行版包列表");
@@ -382,15 +409,12 @@ async fn get_all_releases(
 fn build_local_jdk_dtos(home: &Home) -> Result<Vec<LocalJdkDto>, String> {
     let found = scan::scan_local(home);
 
-    let current_key = store::read_default(home)
-        .ok()
-        .flatten()
-        .and_then(|id| {
-            store::load_index(home)
-                .ok()?
-                .get(&id.to_string())
-                .map(|rec| store::path_key(&store::resolve_dir(home, &rec.dir)))
-        });
+    let current_key = store::read_default(home).ok().flatten().and_then(|id| {
+        store::load_index(home)
+            .ok()?
+            .get(&id.to_string())
+            .map(|rec| store::path_key(&store::resolve_dir(home, &rec.dir)))
+    });
 
     // 规范化路径 → 索引记录（id 供前端判断项目关联占用，日期供列表展示）
     let index_by_path: std::collections::HashMap<String, (String, Option<String>)> =
@@ -478,20 +502,21 @@ async fn unset_default(app: AppHandle) -> Result<(), String> {
 async fn uninstall_jdk(app: AppHandle, dir: String) -> Result<(), String> {
     let home = app_home()?;
     // 递归删除目录是数百 MB 级阻塞 IO：放线程池执行
-    let rec = tauri::async_runtime::spawn_blocking(move || -> Result<store::InstalledJdk, String> {
-        let index = store::load_index(&home).map_err(estr)?;
-        let key = store::path_key(std::path::Path::new(&dir));
-        let rec = index
-            .installed
-            .iter()
-            .find(|r| store::path_key(&store::resolve_dir(&home, &r.dir)) == key)
-            .cloned()
-            .ok_or_else(|| format!("未在管理列表中找到 {dir}"))?;
-        flow::uninstall(&home, &rec.jdk_id()).map_err(estr)?;
-        Ok(rec)
-    })
-    .await
-    .map_err(estr)??;
+    let rec =
+        tauri::async_runtime::spawn_blocking(move || -> Result<store::InstalledJdk, String> {
+            let index = store::load_index(&home).map_err(estr)?;
+            let key = store::path_key(std::path::Path::new(&dir));
+            let rec = index
+                .installed
+                .iter()
+                .find(|r| store::path_key(&store::resolve_dir(&home, &r.dir)) == key)
+                .cloned()
+                .ok_or_else(|| format!("未在管理列表中找到 {dir}"))?;
+            flow::uninstall(&home, &rec.jdk_id()).map_err(estr)?;
+            Ok(rec)
+        })
+        .await
+        .map_err(estr)??;
     log_evt(&app, "success", format!("已卸载 JDK: {}", rec.id));
     Ok(())
 }
@@ -499,9 +524,7 @@ async fn uninstall_jdk(app: AppHandle, dir: String) -> Result<(), String> {
 #[tauri::command]
 async fn open_dir(app: AppHandle, path: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
-    app.opener()
-        .open_path(&path, None::<&str>)
-        .map_err(estr)
+    app.opener().open_path(&path, None::<&str>).map_err(estr)
 }
 
 // ---------- 安装 / 仅下载 ----------
@@ -519,7 +542,11 @@ fn spawn_progress_emitter(
         }
         *guard = Instant::now();
         drop(guard);
-        let percent = if total > 0 { done as f64 / total as f64 * 100.0 } else { 0.0 };
+        let percent = if total > 0 {
+            done as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        };
         let _ = app.emit(
             "install-progress",
             InstallProgress {
@@ -571,7 +598,11 @@ async fn run_install_or_download(
     dir_name: Option<String>,
     token: Arc<AtomicBool>,
 ) {
-    let verb = if dir_name.is_some() { "安装" } else { "下载" };
+    let verb = if dir_name.is_some() {
+        "安装"
+    } else {
+        "下载"
+    };
     log_evt(&app, "info", format!("开始{verb}: {id}"));
 
     let result: Result<(), jvm_core::Error> = async {
@@ -595,7 +626,11 @@ async fn run_install_or_download(
         if !archive_path.exists() {
             emit_stage(&app, &task_id, "download", "");
         } else {
-            log_evt(&app, "info", format!("复用已下载的压缩包: {}", archive_path.display()));
+            log_evt(
+                &app,
+                "info",
+                format!("复用已下载的压缩包: {}", archive_path.display()),
+            );
         }
         log_evt(
             &app,
@@ -640,9 +675,11 @@ async fn run_install_or_download(
             // 设置开启时清理下载压缩包（一键安装与先下载再安装都走这里）
             if settings.auto_clean_download && archive.exists() {
                 match std::fs::remove_file(&archive) {
-                    Ok(()) => {
-                        log_evt(&app, "info", format!("已清除下载文件: {}", archive.display()))
-                    }
+                    Ok(()) => log_evt(
+                        &app,
+                        "info",
+                        format!("已清除下载文件: {}", archive.display()),
+                    ),
                     Err(e) => log_evt(
                         &app,
                         "warn",
@@ -779,7 +816,10 @@ async fn unbind_project(path: String) -> Result<bool, String> {
     let removed = flow::unbind_project(&home, std::path::Path::new(&path)).map_err(estr)?;
     // 设置开启时顺带删除项目目录里的 .jvmrc。best-effort：文件不存在或被
     // 占用都不让解绑整体失败，记日志即可（GUI 弹窗按设置项提示结果语义）
-    if store::load_settings(&home).map_err(estr)?.unbind_deletes_jvmrc {
+    if store::load_settings(&home)
+        .map_err(estr)?
+        .unbind_deletes_jvmrc
+    {
         let jvmrc = std::path::Path::new(&path).join(".jvmrc");
         match std::fs::remove_file(&jvmrc) {
             Ok(()) => tracing::info!(file = %jvmrc.display(), "已删除 .jvmrc"),
@@ -886,6 +926,7 @@ pub fn run() {
             pkg_cache: Mutex::new(HashMap::new()),
             meta_cache: Mutex::new(HashMap::new()),
             cancels: Mutex::new(HashMap::new()),
+            last_settings: Mutex::new(None),
         }))
         .invoke_handler(tauri::generate_handler![
             get_config,

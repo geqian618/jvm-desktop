@@ -75,6 +75,9 @@ async function runHealthRepair() {
 }
 
 onMounted(async () => {
+  // CLI 与 GUI 共写 setting.json：进入设置页先重读一次磁盘，
+  // 外部（CLI）注册/切换的数据源立即可见，也缩小快照写回的覆盖窗口。
+  await store.reloadConfig();
   try {
     // 仅作占位展示与「一键填入」来源，不写回配置：留空 = 跟随后端动态
     // 默认；需要固定路径时用「一键填入」或浏览选择。此前把默认值回填进

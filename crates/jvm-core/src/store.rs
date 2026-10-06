@@ -146,6 +146,21 @@ pub fn save_settings(home: &Home, settings: &Settings) -> Result<()> {
     save_json(&home.settings_file(), settings)
 }
 
+/// GUI 整对象写回时的字段级合并：GUI 与 CLI 是同一份 setting.json 的两个
+/// 写入者，GUI 持有的快照可能在落盘前已被 CLI 改过。`external_write` 为真
+/// （磁盘内容 ≠ GUI 上次读取的快照）时，数据源字段以磁盘为准——CLI 的
+/// 注册/编辑/切换不被陈旧快照抹掉；其余字段以 GUI 为准（设置页正在编辑
+/// 的就是它们）。无并发写入时整体采用 GUI 对象，行为与从前一致。
+pub fn merge_settings(incoming: Settings, disk: &Settings, external_write: bool) -> Settings {
+    if !external_write {
+        return incoming;
+    }
+    let mut merged = incoming;
+    merged.registry = disk.registry.clone();
+    merged.registry_presets = disk.registry_presets.clone();
+    merged
+}
+
 // ---------- index.json ----------
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -399,6 +414,32 @@ mod tests {
         let home = Home::from_root(dir.path().join(tag));
         home.ensure_dirs().unwrap();
         (dir, home)
+    }
+
+    #[test]
+    fn merge_settings_keeps_cli_source_changes() {
+        // 磁盘：CLI 刚注册了一个镜像并切换过去
+        let mut disk = Settings::default();
+        disk.registry = "https://mirror.local/disco".into();
+        disk.registry_presets.push(RegistryPreset {
+            name: "内部镜像".into(),
+            url: "https://mirror.local/disco".into(),
+            built_in: false,
+        });
+        // GUI 的陈旧快照：源还是旧的，但用户改了代理
+        let mut incoming = Settings::default();
+        incoming.proxy = "http://127.0.0.1:7890".into();
+
+        // 有外部写入：数据源字段回磁盘值，其余字段保留 GUI 值
+        let merged = merge_settings(incoming.clone(), &disk, true);
+        assert_eq!(merged.registry, "https://mirror.local/disco");
+        assert_eq!(merged.registry_presets.len(), 3, "CLI 注册的预设保留");
+        assert_eq!(merged.proxy, "http://127.0.0.1:7890");
+
+        // 无外部写入：整体采用 GUI 对象（行为与从前一致）
+        let merged = merge_settings(incoming, &disk, false);
+        assert_eq!(merged.registry, "");
+        assert_eq!(merged.registry_presets.len(), 2);
     }
 
     #[test]
