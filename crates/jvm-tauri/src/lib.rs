@@ -14,6 +14,7 @@ use jvm_core::store::{InstalledJdk, ProjectEntry, Settings};
 use jvm_core::{flow, scan, shim, store, switcher, Home};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_window_state::StateFlags;
 
 /// 元数据/包列表缓存 TTL。
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
@@ -929,8 +930,21 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        // 窗口状态持久化：记住尺寸/位置/最大化，退出自动保存、启动自动恢复
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        // 窗口状态持久化：记住尺寸/位置/最大化，退出自动保存、启动自动恢复。
+        // VISIBLE 交给下方 setup 手动处理：窗口以隐藏方式创建，插件先在
+        // 隐藏状态下恢复尺寸/位置/最大化，再显示，避免启动时出现从
+        // 默认尺寸展开到最大化的可见过渡
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(StateFlags::all() & !StateFlags::VISIBLE)
+                .build(),
+        )
+        .setup(|app| {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+            }
+            Ok(())
+        })
         .manage(SharedState::new(AppState {
             pkg_cache: Mutex::new(HashMap::new()),
             meta_cache: Mutex::new(HashMap::new()),
