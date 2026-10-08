@@ -36,6 +36,7 @@ const zhCN = {
     confirmUnset:
       "取消后「{name}」不再是全局默认：JAVA_HOME 与用户 PATH 将不再指向本工具管理的 JDK，终端里的 java 会回退到系统原有配置。确认取消？",
     uninstall: "卸载",
+    uninstalling: "卸载中…",
     confirmUninstall: "确认卸载？将删除该版本的安装目录。",
     blockedDefault: "「{name}」是全局默认版本，请先将其他版本设为默认，再卸载它",
     blockedProjects:
@@ -200,6 +201,7 @@ const enUS = {
     confirmUnset:
       '"{name}" will stop being the global default: JAVA_HOME and the user PATH will no longer point to a JDK managed by this tool, and java in terminals falls back to the system configuration. Unset?',
     uninstall: "Uninstall",
+    uninstalling: "Uninstalling…",
     confirmUninstall: "Uninstall? The install directory of this version will be deleted.",
     blockedDefault:
       '"{name}" is the global default version. Set another version as default before uninstalling it.',

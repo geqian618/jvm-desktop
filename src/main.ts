@@ -40,4 +40,7 @@ window.addEventListener("error", (e) => {
   }
 });
 
+// 桌面应用不需要 WebView 的默认右键菜单，全局禁用
+window.addEventListener("contextmenu", (e) => e.preventDefault());
+
 app.mount("#app");

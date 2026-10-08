@@ -179,8 +179,15 @@ onMounted(() => store.refreshLocal());
             <button class="btn-ghost btn-sm" @click="api.openDir(jdk.dir)">
               {{ t("installed.open") }}
             </button>
-            <button class="btn-danger btn-sm" @click="removeJdk(jdk)">
-              {{ t("installed.uninstall") }}
+            <button
+              class="btn-danger btn-sm"
+              :disabled="store.uninstallingDir !== null"
+              @click="removeJdk(jdk)"
+            >
+              <template v-if="store.uninstallingDir === jdk.dir">
+                <span class="spin" /> {{ t("installed.uninstalling") }}
+              </template>
+              <template v-else>{{ t("installed.uninstall") }}</template>
             </button>
           </td>
         </tr>
@@ -305,5 +312,14 @@ h2 {
   background: var(--bg2);
   border: 1px solid var(--border-strong);
   color: var(--text);
+}
+
+/* 卸载中 spinner：红色系，匹配 danger 按钮主题 */
+.btn-danger .spin {
+  width: 11px;
+  height: 11px;
+  border-color: color-mix(in srgb, var(--danger) 35%, transparent);
+  border-top-color: var(--danger);
+  margin-right: 2px;
 }
 </style>

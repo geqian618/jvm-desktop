@@ -78,6 +78,8 @@ export const useAppStore = defineStore("app", {
       maintainedOnly: false,
     } as Filters,
     installStates: {} as Record<string, InstallProgress>,
+    /** 正在卸载的 JDK 目录：卸载按钮转圈用（跨界面保持，避免切走再回来状态丢失） */
+    uninstallingDir: null as string | null,
     /** 下载目录里已有归档的包 id：下载按钮置灰为「已下载」，安装可直接复用 */
     downloadedIds: [] as string[],
     logs: [] as AppLog[],
@@ -436,12 +438,15 @@ export const useAppStore = defineStore("app", {
     },
 
     async uninstallJdk(dir: string) {
+      this.uninstallingDir = dir;
       try {
         await api.uninstallJdk(dir);
         this.log("success", `已卸载 JDK: ${dir}`);
       } catch (e) {
         this.log("error", `卸载 JDK 失败: ${e}`);
         throw e;
+      } finally {
+        this.uninstallingDir = null;
       }
       await this.refreshLocal();
     },
