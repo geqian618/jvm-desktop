@@ -166,7 +166,12 @@ impl FoojaySource {
     /// 统一把非 2xx 的错误体转成可读信息（foojay 的错误在 _embedded.errors）。
     async fn error_body(resp: reqwest::Response) -> Error {
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        // 错误体读取同样限时：半死连接在错误路径上也不能挂住调用方。
+        let text = tokio::time::timeout(crate::net::API_TIMEOUT, resp.text())
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
         let detail = serde_json::from_str::<serde_json::Value>(&text)
             .ok()
             .and_then(|v| {
@@ -184,12 +189,12 @@ impl FoojaySource {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<T> {
-        let resp = match self.request(path, query).send().await {
-            Ok(r) if !r.status().is_success() => return Err(Self::error_body(r).await),
-            Ok(r) => r,
-            Err(e) => return Err(e.into()),
-        };
-        Ok(resp.json::<T>().await?)
+        // api_send/api_body 带 30s 响应超时：半死连接不再永久挂起调用方。
+        let resp = crate::net::api_send(self.request(path, query)).await?;
+        if !resp.status().is_success() {
+            return Err(Self::error_body(resp).await);
+        }
+        Ok(crate::net::api_body(resp.json::<T>()).await?)
     }
 
     fn to_remote_package(p: &FjPackage) -> RemotePackage {
@@ -258,7 +263,7 @@ impl FoojaySource {
         latest: bool,
     ) -> Result<Vec<FjPackage>> {
         let params = Self::package_query_params(q, version, latest);
-        let resp = match self.request("/packages", &params).send().await {
+        let resp = match crate::net::api_send(self.request("/packages", &params)).await {
             Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
                 let v = version.unwrap_or("(all)");
                 return Err(Error::msg(format!(
@@ -268,12 +273,12 @@ impl FoojaySource {
             }
             Ok(r) if !r.status().is_success() => return Err(Self::error_body(r).await),
             Ok(r) => r,
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e),
         };
         // 显式取文本再解析：纯 .json() 失败时只给前端一句
         // "error decoding response body"，无法区分连接中断与 JSON 结构问题
         let url = resp.url().clone();
-        let body = match resp.text().await {
+        let body = match crate::net::api_body(resp.text()).await {
             Ok(b) => b,
             Err(e) => {
                 tracing::error!(url = %url, err = ?e, "/packages 响应体读取失败");
@@ -357,12 +362,12 @@ impl RegistrySource for FoojaySource {
     /// `/ids/{id}` 详情：按 URI 直查（URI 来自列表的 pkg_info_uri），
     /// 绕开 `version=` 过滤对部分包（graalvm/dragonwell 等）命不中的问题。
     async fn package_detail_by_uri(&self, uri: &str) -> Result<PackageDetail> {
-        let resp = match self.request(uri, &[]).send().await {
+        let resp = match crate::net::api_send(self.request(uri, &[])).await {
             Ok(r) if !r.status().is_success() => return Err(Self::error_body(r).await),
             Ok(r) => r,
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e),
         };
-        let detail: FjIdDetail = resp.json().await?;
+        let detail: FjIdDetail = crate::net::api_body(resp.json()).await?;
         let Some(entry) = detail.result.first() else {
             return Ok(PackageDetail::default());
         };

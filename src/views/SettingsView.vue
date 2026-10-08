@@ -212,7 +212,9 @@ function saveSourceEditor() {
   }
   if (ed.index < 0) {
     cfg.value.registryPresets.push({ name, url });
-    cfg.value.registry = url;
+    // 与 CLI `jvm config registry` 语义一致：默认只入列不启用，
+    // 由用户点击条目左侧圆点设为当前源
+    store.log("info", t("settings.sourceAddedLog", { name }));
     // 编辑器保持展开并绑定到新建条目：再次保存不会触发 URL 重复校验
     sourceEditor.value = { index: cfg.value.registryPresets.length - 1, name, url };
   } else {

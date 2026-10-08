@@ -92,6 +92,10 @@ pub fn run_java_version(jdk_home: &Path) -> Result<String> {
 }
 
 /// 从已下载归档安装：解压 → 探测根目录与布局 → 验证 → 落位。
+///
+/// 生产路径统一走 `flow::install_downloaded`（自定义目录名 + 锁内登记
+/// 索引）；本函数仅保留给下方单元测试构造完整安装流程。
+#[cfg(test)]
 pub fn install_from_archive(
     archive: &Path,
     id: &JdkId,

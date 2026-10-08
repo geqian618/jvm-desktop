@@ -268,7 +268,12 @@ async fn health_repair(app: AppHandle) -> Result<Vec<String>, String> {
 async fn get_distributions(state: State<'_, SharedState>) -> Result<Vec<DistributionInfo>, String> {
     let home = app_home()?;
     let settings = store::load_settings(&home).map_err(estr)?;
-    let key = format!("dist|{}", settings.registry);
+    // key 与 get_all_releases 保持同一策略：registry/proxy/api_key 任一
+    // 变更都视为新缓存（proxy/api_key 参与客户端构建，改了不能沿用旧缓存）。
+    let key = format!(
+        "dist|{}|{}|{}",
+        settings.registry, settings.proxy, settings.source_api_key
+    );
     if let Some((t, meta)) = state.meta_cache.lock().unwrap().get(&key) {
         if t.elapsed() < CACHE_TTL {
             return Ok(meta.distributions.clone());
@@ -298,7 +303,11 @@ async fn get_distributions(state: State<'_, SharedState>) -> Result<Vec<Distribu
 async fn get_major_versions(state: State<'_, SharedState>) -> Result<Vec<MajorVersion>, String> {
     let home = app_home()?;
     let settings = store::load_settings(&home).map_err(estr)?;
-    let key = format!("majors|{}", settings.registry);
+    // key 策略与 get_distributions 一致（registry/proxy/api_key）。
+    let key = format!(
+        "majors|{}|{}|{}",
+        settings.registry, settings.proxy, settings.source_api_key
+    );
     if let Some((t, meta)) = state.meta_cache.lock().unwrap().get(&key) {
         if t.elapsed() < CACHE_TTL {
             return Ok(meta.majors.clone());

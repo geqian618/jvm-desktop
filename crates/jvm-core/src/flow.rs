@@ -212,18 +212,6 @@ pub async fn download_for_release(
     download_with_plan(home, settings, release, plan, progress, cancel).await
 }
 
-/// 「仅下载」：把安装包压缩文件下载到下载路径，不解压不安装。
-pub async fn download_only(
-    home: &Home,
-    settings: &Settings,
-    release: &Release,
-    progress: Option<Arc<ProgressFn>>,
-    cancel: Option<Arc<AtomicBool>>,
-) -> Result<std::path::PathBuf> {
-    home.ensure_dirs()?;
-    download_for_release(home, settings, release, progress, cancel).await
-}
-
 /// 安装已下载的归档：解压 → 验证 → 写索引。`dir_name` 允许 GUI 自定义
 /// 目录名（如 `{distribution}@{javaVersion}`），缺省用 [`JdkId::to_dir_name`]。
 pub fn install_downloaded(

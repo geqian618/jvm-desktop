@@ -133,11 +133,12 @@ pub fn scan_local(home: &Home) -> Vec<ScannedJdk> {
         !keys.iter().any(|anc| is_descendant(&child, anc))
     });
 
+    // 按版本数值降序（cmp_versions 逐段数值比较，"9.0.x" 不会排到
+    // "17.0.x" 前面）；版本未知的（空串 → 组件 0）排最后。
     out.sort_by(|a, b| {
-        b.java_version
-            .as_deref()
-            .unwrap_or("")
-            .cmp(a.java_version.as_deref().unwrap_or(""))
+        let av = a.java_version.as_deref().unwrap_or("");
+        let bv = b.java_version.as_deref().unwrap_or("");
+        crate::model::cmp_versions(bv, av)
     });
     tracing::info!(total = out.len(), install_root = %install_root.display(), "安装目录 JDK 扫描完成");
     out

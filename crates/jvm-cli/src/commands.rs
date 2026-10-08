@@ -583,11 +583,15 @@ fn doctor(home: &Home) -> Result<()> {
 }
 
 fn check_path(home: &Home, failures: &mut usize) {
-    let bin = home.bin().to_string_lossy().to_string();
+    // Windows 的 PATH 以 ';' 分隔，Unix 以 ':' 分隔；条目与目标统一把
+    // '\' 归一为 '/' 后比较（此前 Unix 下按 ';' 切分 + '/'→'\' 替换，
+    // 恒不匹配，doctor 永远误报「用户 PATH 缺少」）。
+    let bin = home.bin().to_string_lossy().replace('\\', "/");
+    let sep = if cfg!(windows) { ';' } else { ':' };
     let in_process = std::env::var("PATH")
         .map(|p| {
-            p.split(';')
-                .any(|e| e.replace('/', "\\").eq_ignore_ascii_case(&bin))
+            p.split(sep)
+                .any(|e| e.replace('\\', "/").eq_ignore_ascii_case(&bin))
         })
         .unwrap_or(false);
     #[cfg(windows)]

@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { watch } from "vue";
+import { nextTick, watch } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../api";
 import { i18n } from "../i18n";
@@ -26,6 +26,14 @@ interface Filters {
 // 设置自动落盘的防抖计时器与 watcher 注册标记（模块级，store 生命周期内共享）
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let persistWatcherBound = false;
+// 事件监听注册标记：init 失败重试（App.vue 会再调一次 init）时避免重复
+// 注册导致日志/进度事件翻倍
+let appLogListenerBound = false;
+let appErrorListenerBound = false;
+let progressListenerBound = false;
+// reloadConfig 重读设置期间挂起持久化 watcher：引用替换 + normalizeConfig
+// 的变更会触发深度 watcher，不挂起会「无改动也回写 + 打已保存日志」
+let suspendPersist = false;
 
 /** 每个下载任务的速度估算状态：样本窗口 + 每秒才刷新一次的显示值 */
 const speedTrackers = new Map<
@@ -143,14 +151,21 @@ export const useAppStore = defineStore("app", {
     },
 
     async init() {
-      // 先注册日志监听，保证后续动作都能被记录
-      await listen<AppLog>("app-log", (event) => {
-        this.log(event.payload.level, event.payload.message);
-      });
+      // 先注册日志监听，保证后续动作都能被记录（带重入保护：init 失败
+      // 重试时不再重复注册）
+      if (!appLogListenerBound) {
+        appLogListenerBound = true;
+        await listen<AppLog>("app-log", (event) => {
+          this.log(event.payload.level, event.payload.message);
+        });
+      }
       // 前端运行时错误也进日志页（main.ts 里全局捕获后广播到 window）
-      window.addEventListener("app-error", (e) => {
-        this.log("error", `前端错误: ${(e as CustomEvent).detail}`);
-      });
+      if (!appErrorListenerBound) {
+        appErrorListenerBound = true;
+        window.addEventListener("app-error", (e) => {
+          this.log("error", `前端错误: ${(e as CustomEvent).detail}`);
+        });
+      }
 
       this.config = await api.getConfig();
       i18n.global.locale.value = this.config.language as "zh-CN" | "en-US";
@@ -161,6 +176,8 @@ export const useAppStore = defineStore("app", {
         watch(
           () => this.config,
           () => {
+            // reloadConfig 重读期间的引用替换/normalize 变更不算用户编辑
+            if (suspendPersist) return;
             if (persistTimer) clearTimeout(persistTimer);
             persistTimer = setTimeout(() => {
               void this.persistConfig();
@@ -202,8 +219,11 @@ export const useAppStore = defineStore("app", {
       this.filters.archiveType = this.defaultArchiveType;
       this.log("info", "应用启动");
 
-      await listen<InstallProgress>("install-progress", (event) => {
-        const p = event.payload;
+      // 下载/安装进度事件（同样带重入保护）
+      if (!progressListenerBound) {
+        progressListenerBound = true;
+        await listen<InstallProgress>("install-progress", (event) => {
+          const p = event.payload;
         if (p.stage === "download") {
           // 速度估算：进度事件 10 条/秒，若每条都重算显示值，数字一秒会跳
           // 好几次。样本按事件收集（保准确），但显示值每 1s 才按最近 5s
@@ -239,7 +259,8 @@ export const useAppStore = defineStore("app", {
         } else if (p.stage === "cancelled") {
           setTimeout(() => delete this.installStates[p.taskId], 1500);
         }
-      });
+        });
+      }
 
       await Promise.all([
         this.refreshLocal(),
@@ -249,8 +270,16 @@ export const useAppStore = defineStore("app", {
 
     /** 从后端重拉设置（体检修复清空失效目录覆盖后同步输入框） */
     async reloadConfig() {
-      this.config = await api.getConfig();
-      this.normalizeConfig();
+      // 引用替换与 normalizeConfig 的变更会触发 config 深度 watcher：
+      // 挂起持久化，等本次变更冲刷掉再恢复，避免无改动也回写 + 打日志
+      suspendPersist = true;
+      try {
+        this.config = await api.getConfig();
+        this.normalizeConfig();
+        await nextTick();
+      } finally {
+        suspendPersist = false;
+      }
     },
 
     async refreshLocal() {

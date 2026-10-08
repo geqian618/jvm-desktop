@@ -98,14 +98,15 @@ impl AdoptiumSource {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<T> {
-        let resp = self
-            .client
-            .get(format!("{}{path}", self.base))
-            .query(query)
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(resp.json::<T>().await?)
+        // api_send/api_body 带 30s 响应超时：半死连接不再永久挂起调用方。
+        let resp = crate::net::api_send(
+            self.client
+                .get(format!("{}{path}", self.base))
+                .query(query),
+        )
+        .await?
+        .error_for_status()?;
+        Ok(crate::net::api_body(resp.json::<T>()).await?)
     }
 
     fn asset_to_release(
@@ -160,14 +161,14 @@ impl AdoptiumSource {
             ("architecture", query.arch.as_str()),
             ("image_type", query.image_type.as_str()),
         ];
-        let resp = self
-            .client
-            .get(format!("{}{path}", self.base))
-            .query(&params)
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(resp.json::<Vec<AsAsset>>().await?)
+        let resp = crate::net::api_send(
+            self.client
+                .get(format!("{}{path}", self.base))
+                .query(&params),
+        )
+        .await?
+        .error_for_status()?;
+        Ok(crate::net::api_body(resp.json()).await?)
     }
 }
 

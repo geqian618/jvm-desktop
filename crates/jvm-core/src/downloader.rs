@@ -80,6 +80,12 @@ const PROBE_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// [`MIN_PROGRESS_BYTES`]（限速重连每轮都带着远超该值的进展，不消耗
 /// 预算，详见 [`run_chunk`] 文档）。
 const MAX_ATTEMPTS: u32 = 5;
+/// 总长未知（源不支持 Range/HEAD 探测）时单块「整档重来」的次数上限：
+/// 该模式下每次重试已收的数据都会被丢弃（见 [`run_chunk`] 开头的重置
+/// 逻辑），而 ≥[`MIN_PROGRESS_BYTES`] 的进展又会清零连续失败计数——
+/// 「能持续吐几十 KB 再断流」的源将无限重试、永不报错。给整档重来
+/// 单独设预算，超限即报错终止。
+const UNKNOWN_TOTAL_RESTARTS: u32 = 10;
 /// 一轮尝试视为「有效进展」的最少收字节：达到即清零连续失败计数。
 /// 门槛取 64KiB——对 4MiB 起步的分块毫无意义，却足以区分「真的在传」
 /// 与「垂死连接每次漏几十字节」：后者靠 1 字节进展就能把重试循环永续。
@@ -518,6 +524,8 @@ async fn run_chunk(
     // 限速重连的冷却锚点（跨尝试保留）：重连只在"深衰减 + 冷却到期 +
     // 剩余量足够"时发生，频率由冷却时间自然限制，不需要硬上限。
     let mut last_reconnect: Option<Instant> = None;
+    // unknown_total 模式下的整档重来计数（预算见 [`UNKNOWN_TOTAL_RESTARTS`]）。
+    let mut unknown_restarts: u32 = 0;
     loop {
         if is_cancelled() {
             return Err(Error::Cancelled);
@@ -529,6 +537,12 @@ async fn run_chunk(
             let mut sc = shared.sidecar.lock().unwrap();
             let c = &mut sc.chunks[idx];
             if c.end == u64::MAX && c.done > 0 {
+                unknown_restarts += 1;
+                if unknown_restarts >= UNKNOWN_TOTAL_RESTARTS {
+                    return Err(Error::msg(format!(
+                        "下载源不支持断点续传且反复中断（已整档重试 {unknown_restarts} 次），已放弃本次下载"
+                    )));
+                }
                 let dropped = c.done;
                 c.done = 0;
                 drop(sc);
