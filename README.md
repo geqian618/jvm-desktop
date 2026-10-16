@@ -1,117 +1,181 @@
-# JVM Desktop（jvm）
+<div align="center">
+
+<img src="src/assets/icon.png" alt="JVM Desktop" width="120" />
+
+# JVM Desktop
+
+**GUI + CLI 双模式的 JDK 版本管理工具**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](#环境要求)
-[![Rust](https://img.shields.io/badge/Rust-2021%20edition-orange.svg)](#环境要求)
-[![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB.svg)](#环境要求)
-[![Vue](https://img.shields.io/badge/Vue-3-42b883.svg)](#环境要求)
+[![Release](https://img.shields.io/badge/release-v0.1.0-brightgreen.svg)](../../releases)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](#安装)
+[![Rust](https://img.shields.io/badge/Rust-2021%20edition-orange.svg)](#安装)
+[![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB.svg)](#安装)
+[![Vue](https://img.shields.io/badge/Vue-3-42b883.svg)](#安装)
 
-> **参考开源项目 [nvm-desktop](https://github.com/1111mp/nvm-desktop) 同源设计的 JDK 版本管理工具**：
-> 可视化浏览 / 安装 / 切换各 OpenJDK 发行版
-> （Temurin、Zulu、Corretto、GraalVM、Dragonwell、Microsoft OpenJDK、毕盛……），
-> 支持**项目级版本绑定**（`.jvmrc`），GUI + CLI 双模式，跨 Windows / macOS / Linux。
+</div>
+
+> 参考开源项目 [nvm-desktop](https://github.com/1111mp/nvm-desktop) 同源设计开发的 JDK 版本管理工具：
+> 可视化浏览 / 安装 / 切换各 OpenJDK 发行版，支持项目级版本绑定，GUI + CLI 双模式，
+> 跨 Windows / macOS / Linux。
 
 ## 目录
 
-- [项目简介](#项目简介)
+- [简介](#简介)
 - [功能特性](#功能特性)
-- [环境要求](#环境要求)
-- [快速开始](#快速开始)
-- [CLI 使用指南](#cli-使用指南)
+- [安装](#安装)
+- [快速上手](#快速上手)
 - [GUI 使用指南](#gui-使用指南)
-- [版本解析规则](#版本解析规则)
+- [CLI 命令参考](#cli-命令参考)
 - [数据目录](#数据目录)
+- [版本解析规则](#版本解析规则)
 - [配置说明](#配置说明)
 - [数据源管理](#数据源管理)
-- [架构与工作原理](#架构与工作原理)
+- [工作原理](#工作原理)
 - [开发指南](#开发指南)
 - [常见问题](#常见问题)
+- [贡献指南](#贡献指南)
 - [License](#license)
+- [致谢](#致谢)
 
-## 项目简介
+## 简介
 
 日常 Java 开发经常要在多个 JDK 版本、多个发行商之间切换：公司项目用 Corretto 11、
 开源项目用 Temurin 17、试试 GraalVM 原生镜像……手动改 `JAVA_HOME`、维护 `PATH`、
 每个项目记住该用哪个版本，既繁琐又容易出错。
 
-JVM Desktop（命令行下叫 `jvm`）是一款**参考开源项目
-[nvm-desktop](https://github.com/1111mp/nvm-desktop) 同源设计开发的 JDK 版本管理工具**：
-数据目录布局、shim 转发机制、项目级版本绑定与 GUI + CLI 双模式的整体设计均承袭该项目的
-同源理念（项目绑定文件 `.nvmdrc` 在 Java 场景对应为 `.jvmrc`），并针对 JDK 多发行商、
-多平台的场景用 Rust + Tauri 完整重新实现：
+**JVM Desktop**（命令行下叫 `jvm`）用 Rust + Tauri 完整实现了 nvm-desktop 的同源理念
+（项目绑定文件 `.nvmdrc` 在 Java 场景对应为 `.jvmrc`），并针对 JDK 多发行商、
+多平台的场景做了重新设计：
 
 - **一个数据目录**集中管理所有 JDK，`current` 链接指向默认版本，切换只改链接；
 - **`vendor@version` 唯一键**标识每个版本，安装、切换、卸载全部围绕它；
 - **项目级绑定**：项目根放一个 `.jvmrc`（单行 `vendor@version`），进目录即生效，
   可提交 Git，团队共享；
-- **shim 机制**：`java` / `javac` 等命令经 `~/.jvm/bin` 下的 shim 转发，
+- **shim 机制**：`java` / `javac` 等命令经 `<数据根>/bin` 下的 shim 转发，
   shim 按当前目录解析版本，并为子进程注入 `JAVA_HOME`，maven / gradle 无需任何额外配置。
 
 ## 功能特性
 
-- **多发行版支持** — Temurin、Zulu、Corretto、GraalVM（Community）、Dragonwell、
-  Microsoft OpenJDK、毕盛（Bisheng）等，数据源基于 [foojay Disco API](https://api.foojay.io/)，
-  亦可切换 Adoptium 官方 API 或任意 foojay 兼容镜像
-- **GUI + CLI 双模式** — 图形界面（Tauri 2 + Vue 3）负责浏览与安装，命令行负责脚本化与
-  日常切换，两者共享同一份数据与同一套解析规则
-- **项目级版本绑定** — `.jvmrc` + `projects.json` 两级项目绑定，目录向上逐级解析
-- **可靠的下载** — 分块并发、断点续传（`.part` + `.part.json`）、流式 SHA-256 校验，
-  校验和来源可追溯（API 字段 → `<url>.sha256.txt`）
-- **零权限切换（Windows）** — 目录 junction 替代 symlink，无需管理员权限；
-  注册表写入 `HKCU\Environment`，先备份后写入、失败自动回滚
-- **安装目录集中管理** — 本地列表只加载安装目录（设置里的 `installDir`，默认 `<数据根>/versions`）下的 JDK，不扫描本机其他位置
-- **环境自检** — `jvm doctor` 一键诊断 PATH / JAVA_HOME / shim / 链接 / 遮蔽问题
-- **健康检查与自愈** — GUI 检测数据目录换根 / 搬移后的悬空引用，一键修复
-- **代理与镜像** — HTTP 代理、自定义数据源（foojay 兼容 URL + 可选 API Key）
-- **中英文界面** — vue-i18n，明 / 暗主题跟随系统
-- **跨平台** — Windows / macOS / Linux 同一套核心逻辑
+- [x] **多发行版支持** — Temurin、Zulu、Corretto、GraalVM（Community）、Dragonwell、
+      Microsoft OpenJDK、毕盛（Bisheng）等，数据源基于 [foojay Disco API](https://api.foojay.io/)，
+      亦可切换 Adoptium 官方 API 或任意 foojay 兼容镜像
+- [x] **GUI + CLI 双模式** — 图形界面（Tauri 2 + Vue 3）负责浏览与安装，命令行负责脚本化与
+      日常切换，两者共享同一份数据与同一套解析规则
+- [x] **项目级版本绑定** — `.jvmrc` + `projects.json` 两级项目绑定，目录向上逐级解析
+- [x] **可靠的下载** — 分块并发、断点续传（`.part` + `.part.json`）、流式 SHA-256 校验，
+      校验和来源可追溯（API 字段 → `<url>.sha256.txt`）
+- [x] **零权限切换（Windows）** — 目录 junction 替代 symlink，无需管理员权限；
+      注册表写入 `HKCU\Environment`，先备份后写入、失败自动回滚
+- [x] **安装目录集中管理** — 本地列表只加载安装目录（设置里的 `installDir`，默认 `<数据根>/versions`）下的 JDK，不扫描本机其他位置
+- [x] **环境自检与自愈** — `jvm doctor` 一键诊断 PATH / JAVA_HOME / shim / 链接 / 遮蔽问题；
+      GUI 检测数据目录换根 / 搬移后的悬空引用，一键修复
+- [x] **代理与镜像** — HTTP 代理、自定义数据源（foojay 兼容 URL + 可选 API Key）
+- [x] **中英文界面** — 明 / 暗主题跟随系统
+- [x] **跨平台** — Windows / macOS / Linux 同一套核心逻辑
 
-## 环境要求
+## 安装
+
+### 环境要求
 
 | 场景 | 要求 |
 |---|---|
-| 运行 GUI | Windows 10+ / macOS 11+ / Linux（WebKitGTK） |
-| 运行 CLI | 同上，单文件可执行程序 |
-| 源码构建 | Rust 1.77+（Tauri 2 要求）、Node.js 20 LTS+、各平台系统依赖（Tauri  prerequisites） |
+| 运行 GUI / CLI | Windows 10+ / macOS 11+ / Linux（WebKitGTK） |
+| 源码构建 | Rust 1.77+（Tauri 2 要求）、Node.js 20 LTS+、各平台系统依赖（Tauri prerequisites） |
 
-## 快速开始
-
-### 方式一：使用预编译版本
+### 方式一：下载预编译版本
 
 前往 [Releases](../../releases) 页面下载对应平台的安装包：
 
-- **Windows**：`.exe` NSIS 安装包（安装器会自动完成 PATH 配置）
+- **Windows**：`.exe` NSIS 安装包（安装器自动完成 PATH 与环境变量配置）
 - **macOS**：`.dmg`
 - **Linux**：`.deb` / `.AppImage`
-
-安装后启动 GUI，或在终端执行 `jvm --help` 查看命令。
 
 ### 方式二：从源码构建
 
 ```bash
-git clone https://github.com/<your-org>/jvm-desktop.git
+git clone https://github.com/jvmdesktop/jvm-desktop.git
 cd jvm-desktop
 
-# 仅构建 CLI（jvm 命令）
+# 仅构建 CLI（单文件可执行程序，无运行时依赖）
 cargo build --release -p jvm-cli
 # 产物：target/release/jvm
 
-# 构建 GUI（需要 Node 依赖与 Tauri 系统依赖）
+# 构建 GUI（自动先构建 CLI 并拷贝为 shim 载体）
 npm install
 npm run tauri build
 ```
 
+## 快速上手
+
 把 CLI 产物放到任意目录后，首次执行任意命令即自动完成数据目录初始化：
 
 ```bash
-./jvm install temurin@17     # 安装 Temurin 17 最新版
-./jvm use temurin@17         # 设为默认版本
-java -version                # 验证
+./jvm install temurin@17        # 安装 Temurin 17 最新版
+./jvm use temurin@17            # 设为默认版本
+java -version                   # 验证
+
+cd my-project
+./jvm use corretto@21 --project # 把当前项目绑定到 Corretto 21（生成 .jvmrc）
 ```
 
-## CLI 使用指南
+首次 `jvm use` 时的平台差异：
 
-CLI 与 GUI 是同一个数据目录的两个入口：GUI 装的版本 CLI 立即可用，反之亦然。
+- **Windows**：自动写入用户环境变量 `JVM_HOME` / `JAVA_HOME` / `PATH` 并广播，
+  首次配置后重开终端即可，日常切换即时生效；
+- **macOS / Linux**：工具不改动 shell 配置，按提示把下面三行加入
+  `~/.bashrc` 或 `~/.zshrc` 后重开终端（路径以 `jvm home` 输出为准）：
+
+  ```bash
+  export JVM_HOME="$HOME/.jvm"           # 数据根
+  export JAVA_HOME="$JVM_HOME/current"
+  export PATH="$JVM_HOME/bin:$PATH"
+  ```
+
+CLI 与 GUI 是同一个数据目录的两个入口：GUI 装的版本 CLI 立可用，反之亦然。
+完整视频教程见 [`docs/使用教程.mp4`](docs/使用教程.mp4)。
+
+## GUI 使用指南
+
+GUI 为自定义标题栏的桌面窗口，左侧五个页面：
+
+| 页面 | 功能 |
+|---|---|
+| **所有版本** | 按发行商 / 主版本 / 支持类型（LTS/MTS/STS）筛选浏览全部 GA 包，一键安装或仅下载，实时进度（下载 / 解压 / 完成）与取消，已下载的包自动复用 |
+| **已安装** | 本地 JDK 列表（仅安装目录 `installDir` 下的 JDK，不扫描本机其他位置），启用 / 设为默认、卸载，占用检测 |
+| **项目关联** | 项目 → 版本绑定管理：添加目录、绑定 / 解绑、删除 `.jvmrc`（按设置项） |
+| **设置** | 数据源预设管理、代理、安装 / 下载目录、语言、主题、自动清理压缩包等；数据目录异常时顶部显示健康检查横幅，可一键修复 |
+| **日志** | 运行日志（与 `logs/` 文件日志同源） |
+
+界面支持简体中文 / English 与明 / 暗主题（跟随系统）。
+
+## CLI 命令参考
+
+### `jvm --help`
+
+```text
+$ jvm --help
+JDK 版本管理工具（nvm-desktop 同源设计，GUI + CLI 双模式）
+
+Usage: jvm [COMMAND]
+
+Commands:
+  list         列出本地已安装版本
+  list-remote  列出远程可用版本（默认各 LTS 主版本的最新 GA）
+  current      显示当前目录解析到的 JDK
+  use          切换默认版本；--project 时绑定当前目录（写入 .jvmrc）
+  install      安装版本，如 temurin@17 或 temurin@17.0.12+7
+  uninstall    卸载版本
+  which        打印某命令解析到的实际路径
+  doctor       诊断 PATH / JAVA_HOME / shim 配置
+  home         打印 jvm 数据目录
+  config       查看与切换数据源（foojay Disco 兼容接口）
+  help         打印帮助信息或某子命令的帮助
+
+Options:
+  -h, --help     打印帮助信息
+  -V, --version  打印版本号
+```
 
 ### 命令总览
 
@@ -174,7 +238,7 @@ jvm doctor                    # 环境自检
 jvm home                      # 数据目录路径
 ```
 
-### 数据源管理
+### 数据源管理（CLI）
 
 ```bash
 jvm config                                   # 查看当前数据源与预设
@@ -188,31 +252,6 @@ jvm config remove 内部镜像                    # 删除自定义预设（内�
 
 `registry` / `use` / `edit` 在保存前会做一次真实的元信息请求校验可达性，
 确认打不通就不会落盘影响后续命令；`--force` 可跳过校验。
-
-## GUI 使用指南
-
-GUI 为自定义标题栏的桌面窗口，左侧五个页面：
-
-| 页面 | 功能 |
-|---|---|
-| **所有版本** | 按发行商 / 主版本 / 支持类型（LTS/MTS/STS）筛选浏览全部 GA 包，一键安装或仅下载，实时进度（下载 / 解压 / 完成）与取消，已下载的包自动复用 |
-| **已安装** | 本地 JDK 列表（仅安装目录 `installDir` 下的 JDK，不扫描本机其他位置），启用 / 设为默认、卸载，占用检测 |
-| **项目关联** | 项目 → 版本绑定管理：添加目录、绑定 / 解绑、删除 `.jvmrc`（按设置项） |
-| **设置** | 数据源预设管理、代理、安装 / 下载目录、语言、主题、自动清理压缩包等；数据目录异常时顶部显示健康检查横幅，可一键修复 |
-| **日志** | 运行日志（与 `logs/` 文件日志同源） |
-
-界面支持简体中文 / English 与明 / 暗主题（跟随系统）。
-
-## 版本解析规则
-
-CLI、GUI、shim 使用**同一套**解析逻辑，任意目录下执行 `java` 时按以下优先级取版本：
-
-1. **`.jvmrc`** — 从当前目录逐级向上查找项目根的 `.jvmrc`（单行 `vendor@version`，
-   可提交 Git 供团队共享）；
-2. **`projects.json`** — 命中已登记项目根中距离最近的祖先目录；
-3. **全局 `default`** — `jvm use <版本>` 设置的默认版本。
-
-任一层解析到的版本若已卸载或目录损坏，会有明确错误提示而不是静默失败。
 
 ## 数据目录
 
@@ -245,6 +284,17 @@ CLI、GUI、shim 使用**同一套**解析逻辑，任意目录下执行 `java` 
 - **`JAVA_HOME` 指向 `<数据根>/current`**：切换默认版本只重建这个链接，不动环境变量；
 - **安装 / 下载目录可整体搬家**：设置里的 `installDir` / `downloadDir` 可指到任意位置
   （如把 JDK 放到 SSD、下载缓存放到机械盘），留空则用默认位置。
+
+## 版本解析规则
+
+CLI、GUI、shim 使用**同一套**解析逻辑，任意目录下执行 `java` 时按以下优先级取版本：
+
+1. **`.jvmrc`** — 从当前目录逐级向上查找项目根的 `.jvmrc`（单行 `vendor@version`，
+   可提交 Git 供团队共享）；
+2. **`projects.json`** — 命中已登记项目根中距离最近的祖先目录；
+3. **全局 `default`** — `jvm use <版本>` 设置的默认版本。
+
+任一层解析到的版本若已卸载或目录损坏，会有明确错误提示而不是静默失败。
 
 ## 配置说明
 
@@ -289,7 +339,7 @@ CLI、GUI、shim 使用**同一套**解析逻辑，任意目录下执行 `java` 
 - 自定义预设可删除；内置预设可编辑名称 / 地址但不可删除；
 - 删除的数据源正好是当前源时，自动回退官方默认源。
 
-## 架构与工作原理
+## 工作原理
 
 ### 总体结构
 
@@ -334,6 +384,19 @@ CLI、GUI、shim 使用**同一套**解析逻辑，任意目录下执行 `java` 
 | `env` | 平台环境变量读写抽象（Windows 注册表 / Unix 进程环境） |
 | `logging` | `tracing` 滚动日志写入 `logs/` |
 
+### shim 机制
+
+`<数据根>/bin` 下的 `java`、`javac` 等**都是同一个二进制的副本**（busybox 式自分发）：
+
+- 可执行文件按**文件名（argv[0]）**决定角色——名为 `jvm` 时是 CLI，
+  名为 `java` / `javac` / … 时进入 shim 模式，不解析参数、不初始化日志，直接转发；
+- shim 按**当前目录**执行与 CLI 完全相同的版本解析，定位到真实 JDK 后转发参数；
+  Unix 下 `exec` 替换当前进程（信号与退出码语义与直接运行一致），Windows 下等待子进程；
+- shim 会为子进程额外注入 `JAVA_HOME` / `JVM_HOME`——maven、gradle 等构建工具
+  直接读环境变量，**项目级绑定不依赖 shell 里的全局变量也能生效**；
+- 覆盖 7 个高频命令：`java`、`javac`、`jar`、`jshell`、`jlink`、`jpackage`、`javaw`；
+  其余 JDK 工具（`mvn` 自读的 `JAVA_HOME` 等）靠环境变量覆盖。
+
 ### 下载与校验机制
 
 一次完整下载按以下顺序进行：
@@ -348,19 +411,6 @@ CLI、GUI、shim 使用**同一套**解析逻辑，任意目录下执行 `java` 
    原子改名为最终文件；
 6. **断点回收** — 取消 / 失败残留的 `.part` 按 TTL 保留供续传，超期由 CLI / GUI
    启动时自动清理。
-
-### shim 机制
-
-`~/.jvm/bin` 下的 `java`、`javac` 等**都是同一个二进制的副本**（busybox 式自分发）：
-
-- 可执行文件按**文件名（argv[0]）**决定角色——名为 `jvm` 时是 CLI，
-  名为 `java` / `javac` / … 时进入 shim 模式，不解析参数、不初始化日志，直接转发；
-- shim 按**当前目录**执行与 CLI 完全相同的版本解析，定位到真实 JDK 后转发参数；
-  Unix 下 `exec` 替换当前进程（信号与退出码语义与直接运行一致），Windows 下等待子进程；
-- shim 会为子进程额外注入 `JAVA_HOME` / `JVM_HOME`——maven、gradle 等构建工具
-  直接读环境变量，**项目级绑定不依赖 shell 里的全局变量也能生效**；
-- 覆盖 7 个高频命令：`java`、`javac`、`jar`、`jshell`、`jlink`、`jpackage`、`javaw`；
-  其余 JDK 工具（`mvn` 自读的 `JAVA_HOME` 等）靠环境变量覆盖。
 
 ### Windows 环境变量管理
 
@@ -387,7 +437,7 @@ jvm-desktop/
 │   ├── i18n/         # 中英文案
 │   ├── stores/       # Pinia 状态
 │   └── views/        # 五个页面
-├── docs/             # 设计文档
+├── docs/             # 视频教程等文档
 ├── index.html
 ├── package.json
 ├── Cargo.toml        # workspace
@@ -417,7 +467,7 @@ cargo clippy --workspace -- -D warnings   # lint
 - **阻塞 IO 不进 async worker**：解压、删除、`java -version` 验证等重 IO 在
   Tauri 侧走 `spawn_blocking`；
 - **配置原子写**：先 `.tmp` 再 rename，损坏回退默认值；
-- **Windows 兼容**：文件占用预检、junction 链接、注册表备份回滚，见上文专节。
+- **Windows 兼容**：文件占用预检、junction 链接、注册表备份回滚，见[工作原理](#工作原理)专节。
 
 ## 常见问题
 
@@ -453,7 +503,32 @@ JDK，不扫描 `JAVA_HOME`、Windows 注册表或系统常见位置——早期
 **Q：`.jvmrc` 要提交到 Git 吗？**
 推荐提交——它就是给团队共享项目 JDK 版本用的，格式为单行 `vendor@version`。
 
+## 贡献指南
+
+欢迎参与贡献，提 PR 前请阅读以下约定：
+
+1. Fork 本仓库并创建特性分支：`git checkout -b feat/your-feature`；
+2. 一个提交只做一件事，提交信息使用简洁的祈使句；
+3. 提交前确保通过检查：
+
+   ```bash
+   cargo test --workspace
+   cargo clippy --workspace -- -D warnings
+   ```
+
+4. 推送分支并发起 Pull Request，说明改动动机与影响面；
+5. 涉及平台差异的改动（junction / symlink、注册表、占用预检、rc 提示等），
+   请在 PR 中说明在各平台的验证情况。
+
+问题反馈与功能建议请走 [Issues](../../issues)。
 
 ## License
 
 [MIT](LICENSE) © JVM Desktop contributors
+
+## 致谢
+
+- [nvm-desktop](https://github.com/1111mp/nvm-desktop) — 同源设计灵感来源：数据目录布局、shim 转发机制、项目级版本绑定与 GUI + CLI 双模式
+- [foojay Disco API](https://api.foojay.io/) — 默认 JDK 元信息数据源
+- [Adoptium API](https://api.adoptium.net/v3) — Temurin 官方数据源
+- [Tauri](https://tauri.app/) 与 [Vue.js](https://vuejs.org/) — GUI 技术栈
