@@ -468,14 +468,9 @@ shim 转发、项目级版本绑定（`.nvmdrc`）与 GUI + CLI 双模式的设�
 在此向 nvm-desktop 的作者与贡献者致谢。
 
 同时感谢：
-
 - [foojay Disco API](https://api.foojay.io/) 与 [Adoptium API](https://api.adoptium.net/v3) — 提供 OpenJDK 各发行版的版本元数据；
 - [Tauri](https://tauri.app/)、[Vue](https://vuejs.org/) 等开源项目 — 构成了本项目的技术底座。
 
-## 相关文档
-
-- [架构设计说明](docs/架构设计说明.md) — 模块职责、关键决策、JSON Schema 草案、里程碑
-- [使用教程视频](docs/使用教程.mp4)
 
 ## License
 
