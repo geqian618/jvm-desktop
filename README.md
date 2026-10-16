@@ -132,9 +132,6 @@ cd my-project
   export PATH="$JVM_HOME/bin:$PATH"
   ```
 
-CLI 与 GUI 是同一个数据目录的两个入口：GUI 装的版本 CLI 立可用，反之亦然。
-完整视频教程见 [`docs/使用教程.mp4`](docs/使用教程.mp4)。
-
 ## GUI 使用指南
 
 GUI 为自定义标题栏的桌面窗口，左侧五个页面：
