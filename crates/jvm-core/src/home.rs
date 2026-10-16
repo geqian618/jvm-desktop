@@ -1,11 +1,11 @@
 //! 数据目录布局与路径计算。
 //!
 //! 根目录优先取 `JVM_HOME` 环境变量（测试与多实例场景），
-//! 否则为用户主目录下的 `.jvm`。
+//! 否则为安装路径（应用 exe 所在目录）下的 `workspace`。
 //!
 //! 布局：
 //! ```text
-//! ~/.jvm/
+//! <安装路径>/workspace/
 //! ├── versions/<vendor>_<version>/   已安装的 JDK
 //! ├── bin/                           java 等高频命令的 shim 与 jvm 自身
 //! ├── current                        指向当前默认版本的链接（Windows 为 junction）
@@ -61,7 +61,7 @@ impl Home {
     pub fn detect() -> Self {
         let root = match std::env::var_os("JVM_HOME").filter(|v| !v.is_empty()) {
             Some(v) => PathBuf::from(v),
-            None => user_home().join(".jvm"),
+            None => default_root(),
         };
         Self {
             root,
@@ -136,10 +136,73 @@ fn user_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// 默认数据根：安装路径（当前 exe 所在目录）下的 `workspace`。
+///
+/// 平台兼容说明：
+/// - Windows：GUI 与 CLI 本体都在安装目录，直接取 exe 目录；
+/// - CLI 常驻拷贝位于 `<数据根>/bin/jvm`（workspace 之内），此时 exe
+///   目录的上一级就是数据根，避免把 workspace 递归套进 bin 里；
+/// - Unix 同样按 exe 目录推导（macOS 下 exe 在 `*.app/Contents/MacOS`，
+///   数据根会落在 bundle 内；用户可用 `JVM_HOME` 环境变量覆盖到任意
+///   可写位置，shell 提示文案里给出的就是实际生效路径）；
+/// - exe 路径不可得时退回用户主目录下的 `.jvm`。
+fn default_root() -> PathBuf {
+    match std::env::current_exe() {
+        Ok(exe) => root_for_exe(&exe),
+        Err(_) => user_home().join(".jvm"),
+    }
+}
+
+/// 由 exe 路径推导默认数据根（[`default_root`] 的纯函数形态，便于测试）。
+fn root_for_exe(exe: &Path) -> PathBuf {
+    let Some(dir) = exe.parent() else {
+        return user_home().join(".jvm");
+    };
+    let is_cli_in_bin = exe
+        .file_stem()
+        .map(|s| s.eq_ignore_ascii_case("jvm"))
+        .unwrap_or(false)
+        && dir.file_name().map(|n| n == "bin").unwrap_or(false);
+    if is_cli_in_bin {
+        dir.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| dir.join("workspace"))
+    } else {
+        dir.join("workspace")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::Settings;
+
+    #[test]
+    fn default_root_follows_exe_location() {
+        // GUI / CLI 本体都在安装目录：数据根是其下的 workspace
+        #[cfg(windows)]
+        let exe = Path::new("C:\\apps\\JVM Desktop.exe");
+        #[cfg(not(windows))]
+        let exe = Path::new("/opt/jvmdesktop/jvm-desktop");
+        assert_eq!(root_for_exe(exe), exe.parent().unwrap().join("workspace"));
+
+        // CLI 常驻拷贝在 <数据根>/bin/jvm：数据根是 exe 目录的上一级
+        #[cfg(windows)]
+        let shim = Path::new("C:\\apps\\workspace\\bin\\jvm.exe");
+        #[cfg(not(windows))]
+        let shim = Path::new("/opt/jvmdesktop/workspace/bin/jvm");
+        assert_eq!(root_for_exe(shim), shim.parent().unwrap().parent().unwrap());
+
+        // 名为 bin 但 exe 不是 CLI 本体：按普通安装目录处理
+        #[cfg(windows)]
+        let other = Path::new("C:\\apps\\bin\\tool.exe");
+        #[cfg(not(windows))]
+        let other = Path::new("/opt/jvmdesktop/bin/tool");
+        assert_eq!(
+            root_for_exe(other),
+            other.parent().unwrap().join("workspace")
+        );
+    }
 
     #[test]
     fn paths_are_consistent() {

@@ -2,7 +2,7 @@
 //!
 //! 背景：数据根（`JVM_HOME`）与设置里的安装/下载目录都设计为可更改，但
 //! 多处状态以绝对路径落盘——setting.json 的目录覆盖、current 链接目标、
-//! 注册表 JAVA_HOME 与用户 PATH。换根后这些引用不会自动随动，坏状态要
+//! 注册表 JVM_HOME/JAVA_HOME 与用户 PATH。换根后这些引用不会自动随动，坏状态要
 //! 等到用户操作时才以报错暴露。本模块集中检测这几类问题；[`repair`] 按
 //! 依赖顺序修复：清失效覆盖 → 按默认版本完整重切（重切内部会自愈
 //! current、重建 shim、重写环境变量）。
@@ -24,6 +24,8 @@ pub enum HealthCode {
     StalePathOverride,
     /// 用户环境变量 JAVA_HOME 未指向本工具的 current
     JavaHomeStale,
+    /// 用户环境变量 JVM_HOME 未指向本工具的数据根（workspace）
+    JvmHomeStale,
     /// 用户 PATH 缺少本工具的 bin 目录
     PathEntryMissing,
     /// 用户 PATH 存在同义重复条目（展开后指向同一目录）
@@ -134,6 +136,22 @@ fn check_windows_env(home: &Home) -> Vec<HealthIssue> {
     }
     let link = home.current();
     let current_str = link.to_string_lossy().to_string();
+    let root_str = home.root().to_string_lossy().to_string();
+    let jvm_home = env::windows::get_user_env("JVM_HOME");
+    if jvm_home
+        .as_deref()
+        .map(|v| !v.eq_ignore_ascii_case(&root_str))
+        .unwrap_or(true)
+    {
+        out.push(HealthIssue {
+            code: HealthCode::JvmHomeStale,
+            message: format!(
+                "用户环境变量 JVM_HOME 为「{}」，未指向数据根 workspace（换根或外部修改后的残留），修复将改写",
+                jvm_home.as_deref().unwrap_or("未设置")
+            ),
+            fixable: true,
+        });
+    }
     let java_home = env::windows::get_user_env("JAVA_HOME");
     if java_home
         .as_deref()

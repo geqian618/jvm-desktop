@@ -73,6 +73,8 @@ pub fn switch_to(home: &Home, id: &JdkId, env: &mut dyn UserEnvWriter) -> Result
     };
 
     // JAVA_HOME 固定指向 current 链接：之后切换只重建链接，无需再改注册表。
+    // JVM_HOME 指向数据根（workspace）：供 mvn/gradle 之外需要 JDK 集合
+    // 位置的场景与 detect() 定位复用。
     // 平台差异：Windows 直接写用户环境变量；Unix 按提示词要求只提示用户
     // 自行在 shell rc 中加入（不自动改 rc 文件）。
     #[cfg(windows)]
@@ -82,16 +84,21 @@ pub fn switch_to(home: &Home, id: &JdkId, env: &mut dyn UserEnvWriter) -> Result
         // bin，注册表不变——已开终端里 java（shim 每次动态解析 default）与
         // mvn/gradle（JAVA_HOME → current 链接，目标已换新）都即时生效。
         let current_str = home.current().to_string_lossy().to_string();
+        let root_str = home.root().to_string_lossy().to_string();
+        let jvm_home_changed = crate::env::windows::get_user_env("JVM_HOME")
+            .map(|v| !v.eq_ignore_ascii_case(&root_str))
+            .unwrap_or(true);
         let java_home_changed = crate::env::windows::get_user_env("JAVA_HOME")
             .map(|v| !v.eq_ignore_ascii_case(&current_str))
             .unwrap_or(true);
         let path_changed = !crate::env::windows::user_path_contains(&home.bin());
+        env.set("JVM_HOME", &root_str)?;
         env.set("JAVA_HOME", &current_str)?;
         env.append_path_entry(&home.bin())?;
-        outcome.env_updated = java_home_changed || path_changed;
+        outcome.env_updated = jvm_home_changed || java_home_changed || path_changed;
         if outcome.env_updated {
             outcome.hints.push(
-                "已写入用户环境变量 JAVA_HOME/PATH，已开着的终端请重启后生效；日常切换无需重启，java 等命令即时生效"
+                "已写入用户环境变量 JVM_HOME/JAVA_HOME/PATH，已开着的终端请重启后生效；日常切换无需重启，java 等命令即时生效"
                     .to_string(),
             );
         }
@@ -99,18 +106,20 @@ pub fn switch_to(home: &Home, id: &JdkId, env: &mut dyn UserEnvWriter) -> Result
     #[cfg(not(windows))]
     {
         let _ = env;
-        outcome.hints.push(
-            "请将以下两行加入 ~/.bashrc 或 ~/.zshrc 后重开终端：\n  export JAVA_HOME=\"$HOME/.jvm/current\"\n  export PATH=\"$HOME/.jvm/bin:$PATH\""
-                .to_string(),
-        );
+        outcome.hints.push(format!(
+            "请将以下几行加入 ~/.bashrc 或 ~/.zshrc 后重开终端：\n  export JVM_HOME=\"{}\"\n  export JAVA_HOME=\"$JVM_HOME/current\"\n  export PATH=\"{}:$PATH\"",
+            home.root().display(),
+            home.bin().display()
+        ));
     }
 
     Ok(outcome)
 }
 
 /// 取消默认版本：移除 default 登记、current 链接与工具 shim，并清理本
-/// 工具写入的用户环境变量（JAVA_HOME 仅在仍指向 current 链接时删除，
-/// 用户自配的值不动）。本就没有默认版本时返回 Ok(false)。
+/// 工具写入的用户环境变量（JAVA_HOME 仅在仍指向 current 链接、JVM_HOME
+/// 仅在仍指向数据根时删除，用户自配的值不动）。本就没有默认版本时返回
+/// Ok(false)。
 ///
 /// 与 [`switch_to`] 的顺序相反（先摘链接后删 default）：任一步失败都
 /// 不会留下「default 已消失但链接/环境仍指向本工具」的中间态。
@@ -155,11 +164,19 @@ pub fn unset_default(home: &Home, env: &mut dyn UserEnvWriter) -> Result<bool> {
 
     #[cfg(windows)]
     {
+        let root_str = home.root().to_string_lossy().to_string();
         let is_ours = crate::env::windows::get_user_env("JAVA_HOME")
             .map(|v| v.eq_ignore_ascii_case(&link.to_string_lossy()))
             .unwrap_or(false);
         if is_ours {
             env.remove("JAVA_HOME")?;
+        }
+        // JVM_HOME 仅在仍指向本工具数据根时删除（用户自配的值不动）
+        let jvm_home_ours = crate::env::windows::get_user_env("JVM_HOME")
+            .map(|v| v.eq_ignore_ascii_case(&root_str))
+            .unwrap_or(false);
+        if jvm_home_ours {
+            env.remove("JVM_HOME")?;
         }
         env.remove_path_entry(&bin)?;
     }

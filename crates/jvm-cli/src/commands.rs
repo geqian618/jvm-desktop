@@ -627,6 +627,29 @@ fn check_java_home(home: &Home, failures: &mut usize) {
     let want = home.current().to_string_lossy().to_string();
     #[cfg(windows)]
     {
+        // JVM_HOME 应指向数据根（workspace）
+        let want_root = home.root().to_string_lossy().to_string();
+        match jvm_core::env::windows::get_user_env("JVM_HOME") {
+            Some(v) if v.eq_ignore_ascii_case(&want_root) => {
+                println!("{}", ui::ok(format!("注册表 JVM_HOME = {v}")));
+            }
+            Some(v) => {
+                *failures += 1;
+                println!(
+                    "{}",
+                    ui::fail(format!(
+                        "注册表 JVM_HOME = {v}，应为 {want_root}；执行 jvm use 修复"
+                    ))
+                );
+            }
+            None => {
+                *failures += 1;
+                println!(
+                    "{}",
+                    ui::fail("注册表未设置用户 JVM_HOME，执行 jvm use 修复")
+                );
+            }
+        }
         match jvm_core::env::windows::get_user_env("JAVA_HOME") {
             Some(v) if v.eq_ignore_ascii_case(&want) => {
                 println!("{}", ui::ok(format!("注册表 JAVA_HOME = {v}")));

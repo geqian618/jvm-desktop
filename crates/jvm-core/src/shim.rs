@@ -58,7 +58,10 @@ pub fn run_shim(home: &Home, tool: &str) -> i32 {
         Ok((bin, jdk_home)) => {
             // 为子进程注入 JAVA_HOME：mvn/gradle 等构建工具直接读它，
             // 这样项目级绑定不依赖 shell 里的全局变量也能生效。
+            // JVM_HOME 一并注入（指向数据根 workspace），与注册的环境
+            // 变量保持一致，方便子进程定位 JDK 集合。
             std::env::set_var("JAVA_HOME", &jdk_home);
+            std::env::set_var("JVM_HOME", home.root());
             let args: Vec<String> = std::env::args().skip(1).collect();
             forward(&bin, &args)
         }

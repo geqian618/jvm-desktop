@@ -17,6 +17,7 @@ export type HealthIssueCode =
   | "default_target_missing"
   | "stale_path_override"
   | "java_home_stale"
+  | "jvm_home_stale"
   | "path_entry_missing"
   | "path_entry_duplicate";
 

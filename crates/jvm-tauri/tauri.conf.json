@@ -26,8 +26,13 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": "nsis",
     "icon": ["icons/icon.ico"],
-    "resources": ["jvm.exe"]
+    "resources": ["jvm.exe"],
+    "windows": {
+      "nsis": {
+        "installerHooks": "./installer-hooks.nsh"
+      }
+    }
   }
 }
