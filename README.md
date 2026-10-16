@@ -26,9 +26,6 @@
 - [架构与工作原理](#架构与工作原理)
 - [开发指南](#开发指南)
 - [常见问题](#常见问题)
-- [参与贡献](#参与贡献)
-- [致谢](#致谢)
-- [相关文档](#相关文档)
 - [License](#license)
 
 ## 项目简介
@@ -449,27 +446,6 @@ cargo clippy --workspace -- -D warnings   # lint
 
 **Q：`.jvmrc` 要提交到 Git 吗？**
 推荐提交——它就是给团队共享项目 JDK 版本用的，格式为单行 `vendor@version`。
-
-## 参与贡献
-
-欢迎 Issue 与 Pull Request：
-
-1. Fork 本仓库并创建特性分支（`feat/xxx` / `fix/xxx`）；
-2. 提交前确保 `cargo test --workspace` 与 `cargo clippy --workspace -- -D warnings` 全部通过；
-3. 核心逻辑改动请附带单元测试（临时目录隔离，不依赖真实用户目录）；
-4. 提交信息使用语义化格式（`feat:` / `fix:` / `docs:` / `refactor:` …）。
-
-## 致谢
-
-本项目**参考开源项目 [nvm-desktop](https://github.com/1111mp/nvm-desktop) 的同源设计开发**。
-nvm-desktop 以 Tauri 构建、用可视化界面管理多个 Node.js 版本，其数据目录布局、
-shim 转发、项目级版本绑定（`.nvmdrc`）与 GUI + CLI 双模式的设计，为本项目提供了
-直接的设计蓝本；本项目将其理念移植到 Java/JDK 场景并完整重新实现。
-在此向 nvm-desktop 的作者与贡献者致谢。
-
-同时感谢：
-- [foojay Disco API](https://api.foojay.io/) 与 [Adoptium API](https://api.adoptium.net/v3) — 提供 OpenJDK 各发行版的版本元数据；
-- [Tauri](https://tauri.app/)、[Vue](https://vuejs.org/) 等开源项目 — 构成了本项目的技术底座。
 
 
 ## License
