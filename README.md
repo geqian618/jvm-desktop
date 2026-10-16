@@ -503,24 +503,6 @@ JDK，不扫描 `JAVA_HOME`、Windows 注册表或系统常见位置——早期
 **Q：`.jvmrc` 要提交到 Git 吗？**
 推荐提交——它就是给团队共享项目 JDK 版本用的，格式为单行 `vendor@version`。
 
-## 贡献指南
-
-欢迎参与贡献，提 PR 前请阅读以下约定：
-
-1. Fork 本仓库并创建特性分支：`git checkout -b feat/your-feature`；
-2. 一个提交只做一件事，提交信息使用简洁的祈使句；
-3. 提交前确保通过检查：
-
-   ```bash
-   cargo test --workspace
-   cargo clippy --workspace -- -D warnings
-   ```
-
-4. 推送分支并发起 Pull Request，说明改动动机与影响面；
-5. 涉及平台差异的改动（junction / symlink、注册表、占用预检、rc 提示等），
-   请在 PR 中说明在各平台的验证情况。
-
-问题反馈与功能建议请走 [Issues](../../issues)。
 
 ## License
 
