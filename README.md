@@ -13,6 +13,8 @@
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB.svg)](#安装)
 [![Vue](https://img.shields.io/badge/Vue-3-42b883.svg)](#安装)
 
+**简体中文** | [English](README.en.md)
+
 </div>
 
 > 参考开源项目 [nvm-desktop](https://github.com/1111mp/nvm-desktop) 同源设计开发的 JDK 版本管理工具：
