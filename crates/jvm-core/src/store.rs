@@ -5,7 +5,7 @@
 //!
 //! setting.json 采用 GUI（JDK Desktop）设计稿的字段模型：数据源是
 //! foojay 兼容的 URL（registry），代理是单个字符串（空 = 直连），
-//! 另有 JDK 安装目录 / 下载路径 / 额外扫描目录。
+//! 另有 JDK 安装目录 / 下载路径覆盖。
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

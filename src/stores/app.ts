@@ -288,9 +288,9 @@ export const useAppStore = defineStore("app", {
       try {
         this.localJdks = await api.getLocalJdks();
         this.currentJavaHome = await api.getCurrentJavaHome();
-        this.log("info", `本地扫描完成，发现 ${this.localJdks.length} 个 JDK`);
+        this.log("info", `本地 JDK 列表加载完成，发现 ${this.localJdks.length} 个 JDK`);
       } catch (e) {
-        this.log("error", `本地扫描失败: ${e}`);
+        this.log("error", `本地 JDK 列表加载失败: ${e}`);
       }
     },
 
