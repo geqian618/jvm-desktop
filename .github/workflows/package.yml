@@ -1,0 +1,77 @@
+name: Package
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# 同一分支/ tag 的新推送会取消尚未完成的旧构建，避免排队浪费额度
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-nsis:
+    name: Build Windows NSIS installer
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust toolchain (stable, MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # tauri build 会依次执行 tauri.conf.json 里的 beforeBuildCommand：
+      #   npm run build && cargo build --release -p jvm-cli && npm run copy:shim
+      # 然后编译 jvm-tauri 并产出 NSIS 安装包。
+      # windows-latest 镜像已自带 WebView2 Runtime 与 NSIS 依赖，无需额外安装。
+      - name: Build and bundle
+        run: npm run tauri build
+
+      - name: Upload NSIS installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: jvm-desktop-windows-x64
+          path: target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+      # 仅在推送 v* tag 时发布 GitHub Release（workflow_dispatch 构建只上传 Artifact）
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          installers=(target/release/bundle/nsis/*-setup.exe)
+          if [ ${#installers[@]} -eq 0 ]; then
+            echo "::error::No NSIS installer found under target/release/bundle/nsis/"
+            exit 1
+          fi
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${installers[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${installers[@]}" \
+              --title "JVM Desktop $GITHUB_REF_NAME" \
+              --generate-notes
+          fi
