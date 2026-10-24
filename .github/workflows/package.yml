@@ -48,6 +48,11 @@ jobs:
       - name: Build and bundle
         run: npm run tauri build
 
+      # 安装包文件名统一为小写连字符风格（jvm-desktop_0.1.0_x64-setup.exe）
+      - name: Normalize installer filename
+        shell: bash
+        run: bash .github/scripts/normalize-names.sh target/release/bundle/nsis
+
       - name: Upload NSIS installer
         uses: actions/upload-artifact@v4
         with:
@@ -107,6 +112,9 @@ jobs:
         env:
           TAURI_TARGET: ${{ matrix.target }}
 
+      - name: Normalize DMG filename
+        run: bash .github/scripts/normalize-names.sh target/${{ matrix.target }}/release/bundle/dmg
+
       - name: Upload DMG
         uses: actions/upload-artifact@v4
         with:
@@ -155,6 +163,11 @@ jobs:
 
       - name: Build and bundle
         run: npm run tauri build
+
+      - name: Normalize package filenames
+        run: |
+          bash .github/scripts/normalize-names.sh target/release/bundle/appimage
+          bash .github/scripts/normalize-names.sh target/release/bundle/deb
 
       - name: Upload AppImage and deb
         uses: actions/upload-artifact@v4
