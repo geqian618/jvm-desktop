@@ -334,22 +334,30 @@ pub fn write_shims_from(exe: &std::path::Path, home: &Home) -> Result<Vec<PathBu
         {
             continue;
         }
-        match std::fs::copy(exe, &dest) {
-            Ok(_) => written.push(dest),
+        // Unix 权限位要在 move 进 written 之前设置（cfg(unix) 块在 Windows
+        // 下被剔除，若放在 push 之后会导致 Unix 上 borrow-after-move 编译错）。
+        let copied = match std::fs::copy(exe, &dest) {
+            Ok(_) => true,
             Err(e) => {
                 // Windows 下该 shim 正被运行时会拒绝覆盖：shim 进程极短，
                 // 重试一次，仍失败则告警继续（其余命令仍可用）。
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 match std::fs::copy(exe, &dest) {
-                    Ok(_) => written.push(dest),
-                    Err(_) => tracing::warn!("shim {} 写入失败: {e}", dest.display()),
+                    Ok(_) => true,
+                    Err(_) => {
+                        tracing::warn!("shim {} 写入失败: {e}", dest.display());
+                        false
+                    }
                 }
             }
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+        };
+        if copied {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+            }
+            written.push(dest);
         }
     }
     if written.is_empty() {
