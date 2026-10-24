@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   windows-nsis:
-    name: Build Windows NSIS installer
+    name: Windows x64（NSIS 安装包）
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -41,9 +41,9 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      # tauri build 会依次执行 tauri.conf.json 里的 beforeBuildCommand：
-      #   npm run build && cargo build --release -p jvm-cli && npm run copy:shim
-      # 然后编译 jvm-tauri 并产出 NSIS 安装包。
+      # tauri build 会执行 beforeBuildCommand（npm run before:build）：
+      #   vite 构建前端 → cargo build jvm-cli → 复制 CLI 本体为打包资源，
+      # 随后编译 jvm-tauri 并产出 NSIS 安装包。
       # windows-latest 镜像已自带 WebView2 Runtime 与 NSIS 依赖，无需额外安装。
       - name: Build and bundle
         run: npm run tauri build
@@ -56,22 +56,120 @@ jobs:
           if-no-files-found: error
 
       # 仅在推送 v* tag 时发布 GitHub Release（workflow_dispatch 构建只上传 Artifact）
-      - name: Publish GitHub Release
+      - name: Publish to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
+        run: bash .github/scripts/publish-release.sh target/release/bundle/nsis/*-setup.exe
+
+  macos-dmg:
+    name: macOS ${{ matrix.arch }}（DMG）
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: Apple Silicon
+          - target: x86_64-apple-darwin
+            arch: Intel
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+          key: ${{ matrix.target }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # --target 指定产物架构（Apple Silicon / Intel 各出一个 DMG）；
+      # TAURI_TARGET 让 beforeBuildCommand 把 jvm-cli 也按同一架构编译。
+      # 未配置 Apple 开发者证书时 tauri 以 ad-hoc 签名打包，用户首次打开
+      # 需右键 → 打开绕过 Gatekeeper。
+      - name: Build and bundle
+        run: npm run tauri build -- --target ${{ matrix.target }}
+        env:
+          TAURI_TARGET: ${{ matrix.target }}
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: jvm-desktop-macos-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/publish-release.sh target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+
+  linux:
+    name: Linux x64（AppImage & deb）
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      # Tauri v2 Linux 官方依赖清单 + AppImage 打包工具所需的 libfuse2
+      - name: Install Linux system dependencies
         run: |
-          shopt -s nullglob
-          installers=(target/release/bundle/nsis/*-setup.exe)
-          if [ ${#installers[@]} -eq 0 ]; then
-            echo "::error::No NSIS installer found under target/release/bundle/nsis/"
-            exit 1
-          fi
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" "${installers[@]}" --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" "${installers[@]}" \
-              --title "JVM Desktop $GITHUB_REF_NAME" \
-              --generate-notes
-          fi
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev \
+            librsvg2-dev libfuse2
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and bundle
+        run: npm run tauri build
+
+      - name: Upload AppImage and deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: jvm-desktop-linux-x64
+          path: |
+            target/release/bundle/appimage/*.AppImage
+            target/release/bundle/deb/*.deb
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash .github/scripts/publish-release.sh \
+            target/release/bundle/appimage/*.AppImage \
+            target/release/bundle/deb/*.deb

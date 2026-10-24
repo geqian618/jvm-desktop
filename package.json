@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "copy:shim": "node -e \"require('fs').copyFileSync('target/release/jvm.exe','crates/jvm-tauri/jvm.exe')\"",
+    "before:build": "node scripts/before-build.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },

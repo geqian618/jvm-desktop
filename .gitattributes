@@ -1,0 +1,2 @@
+# shell 脚本强制 LF：CI（Linux）里 bash 对 CRLF 敏感
+*.sh text eol=lf
