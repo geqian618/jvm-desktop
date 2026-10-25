@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3781F4"/>
+      <stop offset="1" stop-color="#1750CE"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.28" cy="0.1" r="0.95">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.14"/>
+      <stop offset="0.55" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="118" fill="url(#bg)"/>
+  <rect width="512" height="512" rx="118" fill="url(#glow)"/>
+
+  <!-- 版本指示点：高亮 = 当前激活的版本 -->
+  <rect x="309" y="110" width="84" height="84" rx="28" fill="#A9C9FB"/>
+
+  <!-- 小写 j 主体 -->
+  <path d="M 351 244 L 351 272 A 95 95 0 0 1 161 272" fill="none" stroke="#FFFFFF" stroke-width="84" stroke-linecap="round"/>
+  <rect x="100" y="280" width="312" height="16" fill="url(#bg)"/>
+</svg>
