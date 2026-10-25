@@ -25,7 +25,9 @@
     <clipPath id="c3"><rect x="100" y="334" width="312" height="86"/></clipPath>
   </defs>
 
-  <g clip-path="url(#c1)"><use href="#cup"/></g>
-  <g clip-path="url(#c2)"><use href="#cup"/></g>
-  <g clip-path="url(#c3)"><use href="#cup"/></g>
+  <g transform="translate(-59 -20.6) scale(1.1)">
+    <g clip-path="url(#c1)"><use href="#cup"/></g>
+    <g clip-path="url(#c2)"><use href="#cup"/></g>
+    <g clip-path="url(#c3)"><use href="#cup"/></g>
+  </g>
 </svg>
