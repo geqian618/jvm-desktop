@@ -1,11 +1,31 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
-  <!-- JVM Desktop 单色标志：小写 j + 分层切口，透明背景，用于文档 / 深浅色封面等场景 -->
+  <!-- JVM Desktop 单色标志：分层咖啡杯，透明背景，用于文档 / 深浅色封面等场景 -->
   <defs>
-    <path id="g" d="M 351 244 L 351 272 A 95 95 0 0 1 161 272" fill="none" stroke-linecap="round"/>
-    <clipPath id="top"><rect x="100" y="190" width="312" height="90"/></clipPath>
-    <clipPath id="bot"><rect x="100" y="296" width="312" height="130"/></clipPath>
+    <g id="cup">
+      <circle cx="356" cy="297" r="45" fill="none" stroke="#2B6BE0" stroke-width="21"/>
+      <path fill="#2B6BE0" d="
+        M 183 213
+        L 329 213
+        Q 351 213 347.6 235
+        L 328.7 357
+        Q 325 381 303 381
+        L 209 381
+        Q 187 381 183.3 357
+        L 164.4 235
+        Q 161 213 183 213
+        Z"/>
+      <g fill="none" stroke="#2B6BE0" stroke-width="15" stroke-linecap="round">
+        <path d="M 203 189 C 189 170 217 156 203 141"/>
+        <path d="M 256 183 C 242 162 270 148 256 129"/>
+        <path d="M 309 189 C 295 170 323 156 309 141"/>
+      </g>
+    </g>
+    <clipPath id="c1"><rect x="100" y="100" width="312" height="159"/></clipPath>
+    <clipPath id="c2"><rect x="100" y="272" width="312" height="49"/></clipPath>
+    <clipPath id="c3"><rect x="100" y="334" width="312" height="86"/></clipPath>
   </defs>
-  <rect x="309" y="110" width="84" height="84" rx="28" fill="#2B6BE0"/>
-  <g clip-path="url(#top)"><use href="#g" stroke="#2B6BE0" stroke-width="84"/></g>
-  <g clip-path="url(#bot)"><use href="#g" stroke="#2B6BE0" stroke-width="84"/></g>
+
+  <g clip-path="url(#c1)"><use href="#cup"/></g>
+  <g clip-path="url(#c2)"><use href="#cup"/></g>
+  <g clip-path="url(#c3)"><use href="#cup"/></g>
 </svg>

@@ -13,10 +13,30 @@
   <rect width="512" height="512" rx="118" fill="url(#bg)"/>
   <rect width="512" height="512" rx="118" fill="url(#glow)"/>
 
-  <!-- 版本指示点：高亮 = 当前激活的版本 -->
-  <rect x="309" y="110" width="84" height="84" rx="28" fill="#A9C9FB"/>
+  <!-- handle: drawn behind the cup body -->
+  <circle cx="356" cy="297" r="45" fill="none" stroke="#FFFFFF" stroke-width="21"/>
 
-  <!-- 小写 j 主体 -->
-  <path d="M 351 244 L 351 272 A 95 95 0 0 1 161 272" fill="none" stroke="#FFFFFF" stroke-width="84" stroke-linecap="round"/>
-  <rect x="100" y="280" width="312" height="16" fill="url(#bg)"/>
+  <!-- cup body: rounded trapezoid -->
+  <path fill="#FFFFFF" d="
+    M 183 213
+    L 329 213
+    Q 351 213 347.6 235
+    L 328.7 357
+    Q 325 381 303 381
+    L 209 381
+    Q 187 381 183.3 357
+    L 164.4 235
+    Q 161 213 183 213
+    Z"/>
+
+  <!-- layer gaps: end exactly at the slanted cup edge so the handle stays intact -->
+  <rect x="130" y="259" width="214" height="13" fill="url(#bg)"/>
+  <rect x="130" y="321" width="203" height="13" fill="url(#bg)"/>
+
+  <!-- steam -->
+  <g fill="none" stroke="#FFFFFF" stroke-width="15" stroke-linecap="round">
+    <path d="M 203 189 C 189 170 217 156 203 141"/>
+    <path d="M 256 183 C 242 162 270 148 256 129"/>
+    <path d="M 309 189 C 295 170 323 156 309 141"/>
+  </g>
 </svg>
